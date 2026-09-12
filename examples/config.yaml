@@ -1,0 +1,87 @@
+# oauthcli profiles.
+#
+# Copy this to the path `oauthcli config path` prints, which is normally
+#
+#   Windows   %AppData%\oauth\config.yaml
+#   macOS     ~/Library/Application Support/oauth/config.yaml
+#   Linux     $XDG_CONFIG_HOME/oauth/config.yaml, or ~/.config/oauth/config.yaml
+#
+# or point at any file directly:
+#
+#   oauth --config ./team.yaml discover
+#   OAUTH_CONFIG=/etc/oauth/team.yaml oauthcli check
+#
+# Every setting has a matching flag, so a profile is a default rather than a
+# requirement: `oauthcli token get -p api -s admin` uses the profile's client with
+# a different scope.
+#
+# `oauthcli config init` writes a profile interactively, asking the issuer which
+# scopes and client authentication methods it advertises.
+
+# Which profile a command uses when --profile is not given. With exactly one
+# profile this line is unnecessary.
+default: dev
+
+profiles:
+  # A development server with a confidential client. This is the shape most
+  # audits and client credentials tests want.
+  dev:
+    description: Local Keycloak realm
+    issuer: http://127.0.0.1:8080/realms/dev
+    client:
+      id: oauthcli
+      # A secret here is stored in plain text. Prefer a file the operating
+      # system protects, or the OAUTH_CLIENT_SECRET environment variable.
+      secretFile: ~/.config/oauth/dev.secret
+      # auto picks from what the server advertises; set a method to force it.
+      authMethod: client_secret_basic
+    scopes: [openid, profile, email]
+    redirectUri: http://127.0.0.1:8085/callback
+
+  # A public client for the browser flow: no secret, PKCE carries the proof.
+  # `oauthcli flow code -p me` opens the browser and saves the token.
+  me:
+    description: Personal login at the company IdP
+    issuer: https://login.example.com
+    client:
+      id: oauthcli-desktop
+      authMethod: none
+    scopes: [openid, email, offline_access]
+    redirectUri: http://127.0.0.1:8085/callback
+
+  # A machine client that authenticates with a signed JWT (RFC 7523) and asks
+  # for tokens bound to a resource (RFC 8707).
+  api:
+    description: Service account for the orders API
+    issuer: https://auth.example.com
+    client:
+      id: orders-service
+      key: /etc/oauth/orders-service.pem
+      authMethod: private_key_jwt
+    scopes: [orders:read, orders:write]
+    audience: https://api.example.com
+    resources:
+      - https://api.example.com/orders
+
+  # A server with a self-signed certificate on a lab network. `insecure`
+  # belongs to a profile you have decided about, not to a flag someone reaches
+  # for by habit; the audit records that verification was off.
+  lab:
+    description: Lab server with a self-signed certificate
+    issuer: https://auth.lab.internal
+    client:
+      id: lab-client
+      secret: lab-secret
+    insecure: true
+
+  # A client registered dynamically with `oauthcli client register --save`. The
+  # registration handle lets `oauthcli client get|update|delete` manage it.
+  dynamic:
+    issuer: https://auth.example.com
+    client:
+      id: dyn-3f9a2c
+      secret: generated-by-the-server
+    redirectUri: http://127.0.0.1:8085/callback
+    registration:
+      clientUri: https://auth.example.com/register/dyn-3f9a2c
+      accessToken: rat-generated-by-the-server

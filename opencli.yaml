@@ -1,0 +1,2160 @@
+# yaml-language-server: $schema=../opencli/schema/opencli.schema.json
+$schema: ../opencli/schema/opencli.schema.json
+
+opencli: "0.1.0"
+
+info:
+  title: oauthcli
+  binaryName: oauthcli
+  version: "0.1.0"
+  description: Test, validate and exercise OAuth 2.0, OAuth 2.1 and OpenID Connect servers.
+  longDescription: |
+    oauthcli is a terminal toolkit for OAuth 2.0, OAuth 2.1 and OpenID Connect,
+    built for people and for agents. It discovers what an authorization server
+    publishes, validates it against the RFCs, obtains and decodes tokens, runs
+    the interactive flows, registers clients, and audits a whole installation.
+
+    Start here (for AI agents):
+      oauthcli skill                   Usage guide with workflows and copy-paste recipes
+      oauthcli skill --full            Also include the full command reference
+      oauthcli <command> --help        Every command explains itself and shows examples
+
+    The core loop:
+      oauthcli discover URL            1. What does this issuer publish and support?
+      oauthcli check URL               2. Is it conformant? A checklist per RFC.
+      oauthcli token get --save        3. Get a token with the configured client.
+      oauthcli token inspect           4. Decode and verify the saved token.
+      oauthcli token expect --sub X    5. Assert facts about it; exit 5 on failure.
+
+    Point any command at a server with -i URL -c CLIENT_ID --client-secret-file F,
+    or save those once with "oauthcli config init" and pass -p PROFILE instead.
+    A token obtained with --save is used by later commands that take a TOKEN.
+
+    Every command has --format json (and yaml) with a documented schema, and
+    exit codes distinguish unreachable (2), OAuth error (3), not found (4),
+    failed expectation or non-conformance (5) and invalid token (6).
+
+    Results go to stdout, progress and warnings to stderr, so output pipes
+    cleanly: oauthcli token get -f plain | oauthcli token inspect -
+  homepage: https://github.com/Southclaws/oauthcli
+  contact:
+    name: oauthcli
+    url: https://github.com/Southclaws/oauthcli
+  license:
+    name: MIT
+
+# Connection and client settings are global so any command can be pointed at
+# any server without a profile. Values not given here fall back to the active
+# profile in the config file, then to a built-in default.
+#
+# Shorthands -p, -i, -c, -s, -r, -H and -v are reserved package-wide by these
+# flags; command-local flags must not reuse them.
+flags:
+  - name: config
+    description: Path to the configuration file.
+    type: path
+    envVar: OAUTH_CONFIG
+  - name: profile
+    short: p
+    description: Configuration profile to use.
+    envVar: OAUTH_PROFILE
+  - name: issuer
+    short: i
+    description: Issuer URL of the authorization server.
+    envVar: OAUTH_ISSUER
+    placeholder: URL
+  - name: client-id
+    short: c
+    description: Identifier of the OAuth client.
+    envVar: OAUTH_CLIENT_ID
+  - name: client-secret
+    description: Secret of the OAuth client.
+    sensitive: true
+    envVar: OAUTH_CLIENT_SECRET
+  - name: client-secret-file
+    description: Read the client secret from a file, or - for stdin.
+    type: file
+  - name: client-key
+    description: Private key in PEM form for private_key_jwt client authentication.
+    type: path
+    envVar: OAUTH_CLIENT_KEY
+  - name: auth-method
+    description: "Client authentication method; auto picks from what the server advertises."
+    choices:
+      [
+        auto,
+        client_secret_basic,
+        client_secret_post,
+        client_secret_jwt,
+        private_key_jwt,
+        none,
+      ]
+    default: auto
+  - name: scope
+    short: s
+    description: Scope to request; repeatable, or separated by spaces or commas.
+    repeatable: true
+    splitOnComma: true
+    envVar: OAUTH_SCOPE
+  - name: redirect-uri
+    short: r
+    description: Redirect URI of the client, used by the authorization code flow.
+    envVar: OAUTH_REDIRECT_URI
+    placeholder: URL
+  - name: audience
+    description: Audience to request, sent as the audience parameter.
+    envVar: OAUTH_AUDIENCE
+  - name: resource
+    description: Resource indicator (RFC 8707); repeatable.
+    repeatable: true
+    placeholder: URL
+  - name: token-file
+    description: Read the token from a file, or - for stdin, when no TOKEN is given.
+    type: file
+  - name: header
+    short: H
+    description: Extra HTTP header to send, as Name:Value; repeatable.
+    repeatable: true
+  - name: timeout
+    description: Deadline for a single HTTP request.
+    format: duration
+    default: 15s
+    envVar: OAUTH_TIMEOUT
+  - name: insecure
+    description: Accept a TLS certificate that fails verification.
+    type: boolean
+  - name: allow-http
+    description: Allow plain http URLs; otherwise only loopback addresses may use http.
+    type: boolean
+  - name: dpop
+    description: Bind tokens to a DPoP key (RFC 9449).
+    type: boolean
+  - name: dpop-key
+    description: Private key (EC or RSA) in PEM form to use for DPoP; generated when absent.
+    type: path
+  - name: verbose
+    short: v
+    description: Increase log verbosity (-v, -vv).
+    count: true
+  - name: trace
+    description: Log every HTTP exchange on stderr, with secrets redacted.
+    type: boolean
+  - name: no-color
+    description: Disable colour and styling in output.
+    type: boolean
+    envVar: NO_COLOR
+  - name: theme
+    description: "Colour theme: charm, nord, dracula, mono."
+    choices: [charm, nord, dracula, mono]
+    default: charm
+    envVar: OAUTH_THEME
+
+exitCodes:
+  - code: 0
+    label: OK
+    description: The command completed successfully.
+  - code: 1
+    label: Error
+    description: A generic runtime error occurred.
+  - code: 2
+    label: Unreachable
+    description: The server or a well-known document could not be reached.
+  - code: 3
+    label: OAuthError
+    description: The server answered with an OAuth error response such as invalid_client.
+  - code: 4
+    label: NotFound
+    description: A profile, saved token, metadata document or endpoint does not exist.
+  - code: 5
+    label: Failed
+    description: An expectation was not met or a conformance check found a non-conformance.
+  - code: 6
+    label: InvalidToken
+    description: A token failed signature verification or is expired.
+
+commands:
+  - name: discover
+    operationId: discover
+    aliases: [disco, wellknown]
+    description: Probe every well-known document an issuer can publish.
+    longDescription: |
+      Fetches the well-known documents defined by RFC 8414 (OAuth
+      authorization server metadata), OpenID Connect Discovery, RFC 9728
+      (protected resource metadata) and a few neighbouring specifications, and
+      reports which ones exist.
+
+      Both spellings of a path-bearing issuer are tried: the RFC 8414 form that
+      inserts `.well-known` after the host, and the OpenID form that appends it
+      to the path.
+
+      The summary lists the capabilities the server advertises, so one call
+      answers "what does this server support?".
+    tags: [discovery]
+    arguments:
+      - $ref: "#/components/arguments/issuer-url"
+    flags:
+      - name: keys
+        description: Also fetch the key set the metadata points at.
+        type: boolean
+        default: true
+      - $ref: "#/components/flags/format-text-table"
+    examples:
+      - command: oauthcli discover https://accounts.google.com
+        description: Probe a public issuer.
+      - command: oauthcli discover --format json | jq '.capabilities'
+        description: Capabilities of the active profile's issuer, for a script.
+    output:
+      formatFlag: format
+      formats:
+        - format: text
+          default: true
+          description: Styled summary of documents and capabilities.
+        - format: table
+          description: One row per probed document.
+        - format: plain
+          description: Tab-separated document rows for grep and awk.
+        - format: json
+          schema:
+            $ref: "#/components/schemas/DiscoveryReport"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/DiscoveryReport"
+
+  - name: metadata
+    operationId: metadata
+    aliases: [as, meta]
+    description: Fetch and validate the authorization server metadata.
+    longDescription: |
+      Fetches the RFC 8414 metadata document, or the OpenID Connect discovery
+      document, and validates it: the issuer must match the URL it was
+      derived from, required members must be present, endpoints must be
+      https, and the advertised values must be internally consistent.
+
+      Pass `--raw` to print the document exactly as the server sent it.
+    tags: [discovery]
+    arguments:
+      - $ref: "#/components/arguments/issuer-url"
+    flags:
+      - name: kind
+        description: "Which document to fetch: auto, oauth, openid."
+        choices: [auto, oauth, openid]
+        default: auto
+      - name: raw
+        description: Print the document as the server sent it, without validation output.
+        type: boolean
+      - $ref: "#/components/flags/format-text-markdown"
+    examples:
+      - command: oauthcli metadata https://accounts.google.com
+        description: Validate a public issuer's discovery document.
+      - command: oauthcli metadata --raw --format json | jq .token_endpoint
+        description: Pull one member of the raw document.
+    output:
+      formatFlag: format
+      formats:
+        - format: text
+          default: true
+          description: Endpoints, capabilities and validation findings.
+        - format: markdown
+          description: Rendered Markdown, for a report.
+        - format: json
+          schema:
+            $ref: "#/components/schemas/MetadataReport"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/MetadataReport"
+
+  - name: jwks
+    operationId: jwks
+    aliases: [keys]
+    description: Fetch and inspect the key set of an issuer.
+    longDescription: |
+      Fetches the JSON Web Key Set the metadata points at, or the URL given,
+      and reports each key: identifier, type, algorithm, use, size and any
+      embedded certificate.
+
+      Validation flags keys that would break clients: missing `kid` on a set
+      with more than one key, RSA keys under 2048 bits, and private key
+      material that must never appear in a published set.
+    tags: [discovery]
+    arguments:
+      - name: SOURCE
+        description: Issuer URL, or the URL or path of a key set. Defaults to the active issuer.
+        placeholder: url-or-file
+        required: false
+    flags:
+      - name: kid
+        description: Only show the key with this identifier.
+      - name: pem
+        description: Print each public key in PEM form.
+        type: boolean
+      - $ref: "#/components/flags/format-text-table"
+    examples:
+      - command: oauthcli jwks https://accounts.google.com
+        description: List the signing keys of a public issuer.
+      - command: oauthcli jwks --kid abc123 --pem
+        description: Export one key as PEM.
+    output:
+      formatFlag: format
+      formats:
+        - format: text
+          default: true
+          description: One block per key with validation findings.
+        - format: table
+          description: One row per key.
+        - format: plain
+          description: Tab-separated key rows.
+        - format: json
+          schema:
+            $ref: "#/components/schemas/KeySet"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/KeySet"
+
+  - name: resource
+    operationId: resource
+    aliases: [rs, prm]
+    description: Fetch and validate protected resource metadata (RFC 9728).
+    longDescription: |
+      Fetches `/.well-known/oauth-protected-resource` for a resource server
+      and validates it: the `resource` member must match, and every listed
+      authorization server must itself publish metadata.
+
+      With `--probe`, an unauthenticated request is sent to the resource and
+      its `WWW-Authenticate` challenge is decoded, including the
+      `resource_metadata` parameter that points a client at this document.
+    tags: [discovery]
+    arguments:
+      - name: RESOURCE_URL
+        description: Location of the protected resource, as a URL.
+        placeholder: url
+        required: true
+    flags:
+      - name: probe
+        description: Send an unauthenticated request and decode the WWW-Authenticate challenge.
+        type: boolean
+      - name: follow
+        description: Also fetch and validate the metadata of each listed authorization server.
+        type: boolean
+        default: true
+      - $ref: "#/components/flags/format-text"
+    examples:
+      - command: oauthcli resource https://api.example.com --probe
+        description: Check how an API tells clients where to get a token.
+    output:
+      formatFlag: format
+      formats:
+        - format: text
+          default: true
+        - format: json
+          schema:
+            $ref: "#/components/schemas/ResourceReport"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/ResourceReport"
+
+  - name: token
+    aliases: [tok]
+    description: Obtain, decode, verify, introspect and revoke tokens.
+    tags: [tokens]
+    commands:
+      - name: get
+        operationId: tokenGet
+        aliases: [fetch]
+        description: Obtain a token with a non-interactive grant.
+        longDescription: |
+          Posts to the token endpoint with the chosen grant and prints the
+          response. The default grant is `client_credentials`.
+
+          Every access token that is a JWT is decoded and, when the issuer
+          publishes a key set, its signature is verified. The response headers
+          are checked against RFC 6749 §5.1 (`Cache-Control: no-store`).
+
+          `password` is supported for testing legacy servers, with a warning:
+          OAuth 2.1 removes it. `jwt-bearer` (RFC 7523) sends `--assertion`;
+          `token-exchange` (RFC 8693) sends `--subject-token`.
+        arguments: []
+        flags:
+          - name: grant
+            short: g
+            description: "Grant type."
+            choices:
+              [
+                client_credentials,
+                password,
+                refresh_token,
+                jwt-bearer,
+                token-exchange,
+              ]
+            default: client_credentials
+          - name: username
+            short: u
+            description: Resource owner user name, for the password grant.
+          - name: password
+            description: Resource owner password, for the password grant.
+            sensitive: true
+            envVar: OAUTH_PASSWORD
+          - name: refresh-token
+            description: Refresh token, for the refresh_token grant.
+            sensitive: true
+            envVar: OAUTH_REFRESH_TOKEN
+          - name: assertion
+            description: Signed JWT assertion for the jwt-bearer grant.
+            sensitive: true
+          - name: subject-token
+            description: Token to exchange, for the token-exchange grant.
+            sensitive: true
+          - name: subject-token-type
+            description: Type of --subject-token.
+            default: urn:ietf:params:oauth:token-type:access_token
+          - name: actor-token
+            description: Actor token, for delegation with the token-exchange grant.
+            sensitive: true
+          - name: actor-token-type
+            description: Type of --actor-token.
+            default: urn:ietf:params:oauth:token-type:access_token
+          - name: requested-token-type
+            description: Token type to request from a token exchange.
+          - name: param
+            description: Extra form parameter to send, as name=value; repeatable.
+            repeatable: true
+          - name: save
+            description: Save the token for the active profile so later commands can use it.
+            type: boolean
+          - name: no-verify
+            description: Do not verify the signature of a JWT access token.
+            type: boolean
+          - $ref: "#/components/flags/format-text-plain"
+        examples:
+          - command: oauthcli token get --profile api
+            description: Client credentials with a profile's client.
+          - command: oauthcli token get -i https://auth.example.com -c app --client-secret-file ./secret --scope read
+            description: One-off client credentials without a profile.
+          - command: oauthcli token get --format plain | oauthcli token inspect -
+            description: Pipe the access token into the decoder.
+          - command: oauthcli token get --dpop --save
+            description: Obtain a DPoP-bound token and keep it for later commands.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+              description: The token response, decoded.
+            - format: plain
+              description: The access token alone, ready to pipe.
+            - format: json
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+
+      - name: refresh
+        operationId: tokenRefresh
+        description: Refresh a token.
+        longDescription: |
+          Posts a `refresh_token` grant. Without REFRESH_TOKEN the saved token
+          of the active profile is refreshed, and the result replaces it when
+          `--save` is set.
+
+          The response is checked for refresh token rotation, which OAuth 2.1
+          requires for public clients.
+        arguments:
+          - name: REFRESH_TOKEN
+            description: Refresh token to present. Defaults to the saved token of the profile; - reads stdin.
+            placeholder: refresh-token
+            required: false
+            sensitive: true
+        flags:
+          - name: save
+            description: Replace the saved token of the active profile with the result.
+            type: boolean
+          - name: no-verify
+            description: Do not verify the signature of a JWT access token.
+            type: boolean
+          - $ref: "#/components/flags/format-text-plain"
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: plain
+              description: The new access token alone.
+            - format: json
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+
+      - name: inspect
+        operationId: tokenInspect
+        aliases: [decode, show]
+        description: Decode a token and verify its signature and timestamps.
+        longDescription: |
+          Decodes a JWT and prints its header and claims with timestamps in
+          human terms. When the token carries an `iss` claim, or an issuer is
+          configured, the signature is verified against the issuer's key set.
+          `--secret` verifies an HMAC-signed token instead.
+
+          An opaque token is reported as such, with a hint to use
+          `token introspect`.
+
+          Without TOKEN the saved token of the active profile is inspected; a
+          TOKEN of `-` reads it from stdin, which keeps it out of shell history.
+        arguments:
+          - $ref: "#/components/arguments/token"
+        flags:
+          - name: secret
+            description: Shared secret for verifying an HMAC-signed token.
+            sensitive: true
+          - name: keys
+            description: Key set to verify against, as a URL or file path, instead of the issuer's.
+          - name: no-verify
+            description: Decode only; do not verify the signature.
+            type: boolean
+          - name: id-token
+            description: Treat the token as an ID token and apply the OpenID Connect validation rules.
+            type: boolean
+          - $ref: "#/components/flags/format-text"
+        envVars:
+          - name: OAUTH_TOKEN
+            description: Token to inspect when no TOKEN argument is given.
+        examples:
+          - command: oauthcli token inspect eyJhbGciOi...
+            description: Decode and verify a token.
+          - command: oauthcli token inspect - < token.txt
+            description: Read the token from stdin.
+          - command: oauthcli token inspect --format json | jq .claims.sub
+            description: Pull one claim from the saved token.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+              description: Header, claims, timing and signature status.
+            - format: json
+              schema:
+                $ref: "#/components/schemas/TokenInfo"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/TokenInfo"
+
+      - name: introspect
+        operationId: tokenIntrospect
+        description: Ask the server about a token (RFC 7662).
+        longDescription: |
+          Posts the token to the introspection endpoint with the client's
+          credentials and prints the response. The response is checked for
+          the members RFC 7662 requires, and its claims are compared with the
+          token's own claims when it is a JWT.
+        arguments:
+          - $ref: "#/components/arguments/token"
+        flags:
+          - name: hint
+            description: "Value of token_type_hint: access_token, refresh_token."
+            choices: [access_token, refresh_token]
+          - $ref: "#/components/flags/format-text"
+        envVars:
+          - name: OAUTH_TOKEN
+            description: Token to introspect when no TOKEN argument is given.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: json
+              schema:
+                $ref: "#/components/schemas/IntrospectionReport"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/IntrospectionReport"
+
+      - name: revoke
+        operationId: tokenRevoke
+        description: Revoke a token (RFC 7009).
+        longDescription: |
+          Posts the token to the revocation endpoint. A conformant server
+          answers 200 whether or not the token was valid, so success here
+          means "the server accepted the request", and `--verify` follows up
+          with an introspection to confirm the token is inactive.
+        arguments:
+          - $ref: "#/components/arguments/token"
+        flags:
+          - name: hint
+            description: "Value of token_type_hint: access_token, refresh_token."
+            choices: [access_token, refresh_token]
+          - name: verify
+            description: Introspect the token afterwards to confirm it is inactive.
+            type: boolean
+          - name: forget
+            description: Also delete the saved token of the active profile.
+            type: boolean
+          - $ref: "#/components/flags/format-text"
+        envVars:
+          - name: OAUTH_TOKEN
+            description: Token to revoke when no TOKEN argument is given.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: json
+              schema:
+                $ref: "#/components/schemas/RevocationReport"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/RevocationReport"
+
+      - name: expect
+        operationId: tokenExpect
+        aliases: [assert, test]
+        description: Assert facts about a token; exit 5 when one does not hold.
+        longDescription: |
+          Decodes the token and checks every expectation given. The command
+          exits 0 when all hold and 5 when any fails, so it slots into a test
+          script or an agent's plan.
+
+          `--claim name=value` requires equality with the string form of the
+          claim; `--claim name~pattern` requires a regular expression match;
+          `--claim aud+=api` requires membership in an array claim. `--has`
+          and `--missing` check presence. Signature verification and expiry
+          are checked by default.
+        arguments:
+          - $ref: "#/components/arguments/token"
+        flags:
+          - name: claim
+            description: Expected claim, as name=value, name~regex or name+=member; repeatable.
+            repeatable: true
+          - name: has
+            description: Claim that must be present; repeatable.
+            repeatable: true
+          - name: missing
+            description: Claim that must be absent; repeatable.
+            repeatable: true
+          - name: sub
+            description: Expected subject.
+          - name: aud
+            description: Audience the token must include; repeatable.
+            repeatable: true
+          - name: iss
+            description: Expected issuer. Defaults to the configured issuer when one is known.
+          - name: alg
+            description: Expected signing algorithm.
+          - name: typ
+            description: Expected JOSE header type, e.g. at+jwt.
+          - name: scope-includes
+            description: Scope that must be granted; repeatable.
+            repeatable: true
+          - name: min-ttl
+            description: Minimum remaining lifetime.
+            format: duration
+            default: 0s
+          - name: max-ttl
+            description: Maximum total lifetime from iat to exp.
+            format: duration
+            default: 0s
+          - name: allow-expired
+            description: Do not fail on an expired token.
+            type: boolean
+          - name: no-verify
+            description: Do not require a valid signature.
+            type: boolean
+          - name: active
+            description: Also require the introspection endpoint to report the token active.
+            type: boolean
+          - name: quiet
+            short: q
+            description: Print nothing; the exit code is the result.
+            type: boolean
+          - $ref: "#/components/flags/format-text"
+        envVars:
+          - name: OAUTH_TOKEN
+            description: Token to test when no TOKEN argument is given.
+        examples:
+          - command: oauthcli token expect --sub 1234 --aud https://api.example.com --scope-includes read
+            description: Check the saved token's subject, audience and scope.
+          - command: oauthcli token expect - --claim 'email~@example\.com$' --typ at+jwt < token.txt
+            description: Regular expression and header checks on a token from stdin.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+              description: One line per expectation.
+            - format: json
+              schema:
+                $ref: "#/components/schemas/ExpectationReport"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/ExpectationReport"
+
+      - name: status
+        operationId: tokenStatus
+        description: Show the tokens saved for each profile.
+        arguments: []
+        flags:
+          - $ref: "#/components/flags/format-text-table"
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: table
+            - format: plain
+            - format: json
+              schema:
+                $ref: "#/components/schemas/TokenStatusList"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/TokenStatusList"
+
+      - name: clear
+        operationId: tokenClear
+        aliases: [forget, logout]
+        description: Delete the saved token of the active profile, or of every profile.
+        arguments: []
+        flags:
+          - name: all
+            description: Delete the saved tokens of every profile.
+            type: boolean
+
+  - name: userinfo
+    operationId: userinfo
+    aliases: [me, whoami]
+    description: Call the UserInfo endpoint with an access token.
+    longDescription: |
+      Sends the token as a bearer credential (or a DPoP credential when the
+      saved token is DPoP-bound) to the `userinfo_endpoint` and prints the
+      claims. The response is checked for a `sub`, and compared against the
+      saved ID token when there is one.
+    tags: [tokens]
+    arguments:
+      - $ref: "#/components/arguments/token"
+    flags:
+      - name: expect-sub
+        description: Fail unless the returned subject equals this value.
+      - $ref: "#/components/flags/format-text"
+    envVars:
+      - name: OAUTH_TOKEN
+        description: Token to present when no TOKEN argument is given.
+    output:
+      formatFlag: format
+      formats:
+        - format: text
+          default: true
+        - format: json
+          schema:
+            $ref: "#/components/schemas/UserInfoReport"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/UserInfoReport"
+
+  - name: flow
+    aliases: [login, auth]
+    description: Run an interactive authorization flow.
+    tags: [flows]
+    commands:
+      - name: code
+        operationId: flowCode
+        aliases: [authorization-code, browser]
+        description: Run the authorization code flow with PKCE.
+        longDescription: |
+          Builds an authorization request with PKCE (S256), a fresh `state`
+          and, when `openid` is in scope, a `nonce`; listens on the loopback
+          redirect URI; opens the browser; exchanges the returned code; and
+          validates the ID token.
+
+          `--par` pushes the request first (RFC 9126) and sends only the
+          `request_uri` to the browser. `--manual` prints the URL and waits
+          for the redirect URL to be pasted back, for a machine with no
+          browser. The authorization URL is always printed to stderr so an
+          agent can hand it to a person.
+
+          The redirect URI defaults to `http://127.0.0.1:<port>/callback`.
+        arguments: []
+        flags:
+          - name: port
+            description: Loopback port to listen on (0 = pick a free one).
+            type: integer
+            default: 0
+          - name: no-browser
+            description: Print the authorization URL instead of opening a browser.
+            type: boolean
+          - name: manual
+            description: Do not listen; paste the redirect URL back when asked.
+            type: boolean
+          - name: par
+            description: Push the authorization request (RFC 9126) before redirecting.
+            type: boolean
+          - name: no-pkce
+            description: Omit PKCE. Only useful to prove that a server rejects it.
+            type: boolean
+          - name: prompt
+            description: "Prompt parameter for OpenID Connect: none, login, consent, select_account."
+          - name: login-hint
+            description: Hint the identifier of the user to log in.
+          - name: max-age
+            description: Maximum authentication age to request.
+            format: duration
+            default: 0s
+          - name: response-mode
+            description: "Response mode: query, form_post, fragment."
+            choices: [query, form_post, fragment]
+          - name: state
+            description: Fixed state value; generated when absent.
+          - name: nonce
+            description: Fixed nonce value; generated when absent.
+          - name: param
+            description: Extra authorization request parameter, as name=value; repeatable.
+            repeatable: true
+          - name: wait
+            description: How long to wait for the browser to come back.
+            format: duration
+            default: 5m
+          - name: save
+            description: Save the token for the active profile so later commands can use it.
+            type: boolean
+            default: true
+          - name: no-verify
+            description: Do not verify JWT signatures.
+            type: boolean
+          - $ref: "#/components/flags/format-text-plain"
+        examples:
+          - command: oauthcli flow code --profile dev
+            description: Log in with the browser and save the token.
+          - command: oauthcli flow code --scope openid,email --par
+            description: Push the request first and ask for an ID token.
+          - command: oauthcli flow code --manual --no-browser
+            description: Headless machine, copy the URL by hand and paste the result.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: plain
+              description: The access token alone.
+            - format: json
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+
+      - name: device
+        operationId: flowDevice
+        description: Run the device authorization flow (RFC 8628).
+        longDescription: |
+          Requests a device code, shows the user code and verification URL
+          (and a QR code, on request), then polls the token endpoint at the
+          interval the server asked for until the user approves, denies, or
+          the code expires. `slow_down` is honoured.
+        arguments: []
+        flags:
+          - name: no-browser
+            description: Do not open the verification URL in a browser.
+            type: boolean
+          - name: qr
+            description: Draw the verification URL as a QR code.
+            type: boolean
+          - name: param
+            description: Extra device authorization parameter, as name=value; repeatable.
+            repeatable: true
+          - name: save
+            description: Save the token for the active profile so later commands can use it.
+            type: boolean
+            default: true
+          - name: no-verify
+            description: Do not verify JWT signatures.
+            type: boolean
+          - $ref: "#/components/flags/format-text-plain"
+        examples:
+          - command: oauthcli flow device --qr
+            description: Log in from a device with no browser.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: plain
+              description: The access token alone.
+            - format: json
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+
+  - name: client
+    aliases: [dcr]
+    description: Register and manage clients dynamically (RFC 7591, RFC 7592).
+    tags: [clients]
+    commands:
+      - name: register
+        operationId: clientRegister
+        aliases: [new]
+        description: Register a client at the registration endpoint.
+        longDescription: |
+          Builds a client metadata document from flags, or reads one with
+          `--from`, and posts it to the `registration_endpoint`. An initial
+          access token can be supplied with `--initial-token` for servers that
+          protect registration.
+
+          The response is validated against RFC 7591: `client_id` must be
+          present, and every metadata value echoed back must be one the
+          request asked for or a documented substitute. With `--save` the new
+          client id and secret are written into the active profile.
+        arguments: []
+        flags:
+          - name: from
+            description: Client metadata document to send, as a JSON file or - for stdin.
+            type: file
+          - name: client-name
+            short: n
+            description: Human-readable client name.
+          - name: grant-type
+            description: Grant type the client will use; repeatable.
+            repeatable: true
+            splitOnComma: true
+          - name: response-type
+            description: Response type the client will use; repeatable.
+            repeatable: true
+            splitOnComma: true
+          - name: token-auth
+            description: Requested token_endpoint_auth_method.
+            choices:
+              [client_secret_basic, client_secret_post, private_key_jwt, none]
+          - name: client-uri
+            description: Home page of the client.
+          - name: logo-uri
+            description: Logo of the client.
+          - name: contact
+            description: Contact e-mail; repeatable.
+            repeatable: true
+          - name: software-id
+            description: Software identifier shared by every instance of this client.
+          - name: software-version
+            description: Version of the client software.
+          - name: jwks-uri
+            description: Key set of the client, for private_key_jwt or signed requests.
+          - name: initial-token
+            description: Initial access token that authorizes the registration.
+            sensitive: true
+            envVar: OAUTH_INITIAL_TOKEN
+          - name: param
+            description: Extra metadata member, as name=value or name=json; repeatable.
+            repeatable: true
+          - name: save
+            description: Write the returned client id and secret into the active profile.
+            type: boolean
+          - name: reveal
+            description: Show the client secret and registration access token in full.
+            type: boolean
+          - $ref: "#/components/flags/format-text"
+        examples:
+          - command: oauthcli client register -n "my test client" -r http://127.0.0.1:8085/callback --save
+            description: Register a loopback client and start using it.
+          - command: oauthcli client register --from client.json --initial-token "$TOKEN"
+            description: Register from a metadata document.
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: json
+              schema:
+                $ref: "#/components/schemas/RegistrationReport"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/RegistrationReport"
+
+      - name: get
+        operationId: clientGet
+        aliases: [read]
+        description: Read a registered client's configuration (RFC 7592).
+        arguments: []
+        flags:
+          - $ref: "#/components/flags/registration-uri"
+          - $ref: "#/components/flags/registration-token"
+          - name: reveal
+            description: Show the client secret in full.
+            type: boolean
+          - $ref: "#/components/flags/format-text"
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: json
+              schema:
+                $ref: "#/components/schemas/RegistrationReport"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/RegistrationReport"
+
+      - name: update
+        operationId: clientUpdate
+        description: Replace a registered client's configuration (RFC 7592).
+        longDescription: |
+          Reads the current configuration, applies the changes given, and
+          puts the whole document back, as RFC 7592 requires.
+        arguments: []
+        flags:
+          - $ref: "#/components/flags/registration-uri"
+          - $ref: "#/components/flags/registration-token"
+          - name: from
+            description: Replacement metadata document, as a JSON file or - for stdin.
+            type: file
+          - name: client-name
+            short: n
+            description: New client name.
+          - name: grant-type
+            description: New grant type list; repeatable.
+            repeatable: true
+            splitOnComma: true
+          - name: param
+            description: Metadata member to set, as name=value or name=json; repeatable.
+            repeatable: true
+          - name: reveal
+            description: Show the client secret in full.
+            type: boolean
+          - $ref: "#/components/flags/format-text"
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: json
+              schema:
+                $ref: "#/components/schemas/RegistrationReport"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/RegistrationReport"
+
+      - name: delete
+        operationId: clientDelete
+        aliases: [rm]
+        description: Deprovision a registered client (RFC 7592).
+        arguments: []
+        flags:
+          - $ref: "#/components/flags/registration-uri"
+          - $ref: "#/components/flags/registration-token"
+          - name: yes
+            short: y
+            description: Skip the confirmation prompt.
+            type: boolean
+
+  - name: cimd
+    description: Work with client ID metadata documents.
+    longDescription: |
+      A client ID metadata document lets a client identify itself with a URL
+      instead of a pre-registered identifier: the `client_id` is an https URL
+      that serves the client's metadata as JSON. A server that supports it
+      advertises `client_id_metadata_document_supported: true`.
+    tags: [clients]
+    commands:
+      - name: check
+        operationId: cimdCheck
+        aliases: [validate]
+        description: Fetch a client ID metadata document and validate it.
+        longDescription: |
+          Fetches the document at URL and validates it: the URL must be
+          https with a path and no fragment; `client_id` must equal the URL;
+          `redirect_uris` must be present; `token_endpoint_auth_method` must
+          be one a URL-identified client can use; and the response must be
+          JSON with the right content type.
+
+          When an issuer is configured, its metadata is checked for
+          `client_id_metadata_document_supported`.
+        arguments:
+          - name: URL
+            description: Location of the client ID metadata document, as an https URL.
+            placeholder: url
+            required: true
+            format: uri
+        flags:
+          - $ref: "#/components/flags/format-text"
+        output:
+          formatFlag: format
+          formats:
+            - format: text
+              default: true
+            - format: json
+              schema:
+                $ref: "#/components/schemas/CimdReport"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/CimdReport"
+
+      - name: new
+        operationId: cimdNew
+        aliases: [init, template]
+        description: Write a client ID metadata document to host at a URL.
+        arguments:
+          - name: URL
+            description: The https URL the document will be served from; it becomes the client_id.
+            placeholder: url
+            required: true
+            format: uri
+        flags:
+          - name: client-name
+            short: n
+            description: Human-readable client name.
+            default: oauthcli
+          - name: grant-type
+            description: Grant type the client will use; repeatable.
+            repeatable: true
+            splitOnComma: true
+          - name: token-auth
+            description: token_endpoint_auth_method to declare.
+            choices: [none, private_key_jwt]
+            default: none
+          - name: jwks-uri
+            description: Key set of the client, required for private_key_jwt.
+          - name: out
+            short: o
+            description: File to write, or - for stdout.
+            type: file
+            default: "-"
+        examples:
+          - command: oauthcli cimd new https://app.example.com/oauth/client.json -r https://app.example.com/callback
+            description: Print a document to host on the client's site.
+
+  - name: check
+    operationId: check
+    aliases: [audit, conformance]
+    description: Audit an issuer against the OAuth and OpenID specifications.
+    longDescription: |
+      Discovers everything the issuer publishes and runs a checklist of
+      conformance checks grouped by specification. Each specification is
+      reported as **supported and conformant**, **supported but
+      non-conformant**, **not supported**, or **not tested**.
+
+      Without credentials the checks are limited to what can be observed
+      anonymously: metadata, key sets, TLS, endpoint behaviour on bad input,
+      and the authorization endpoint's handling of a request without PKCE.
+
+      With a client id and secret the token endpoint is exercised: a client
+      credentials token is obtained, decoded, verified, introspected and
+      revoked; error responses are checked for shape; and DPoP, resource
+      indicators, PAR and the device flow are tried where advertised.
+
+      Checks that create state on the server, such as dynamic client
+      registration, are opt-in.
+    tags: [conformance]
+    arguments:
+      - $ref: "#/components/arguments/issuer-url"
+    flags:
+      - name: only
+        description: Only run these specifications, by id such as rfc8414; repeatable.
+        repeatable: true
+        splitOnComma: true
+      - name: skip
+        description: Skip these specifications; repeatable.
+        repeatable: true
+        splitOnComma: true
+      - name: offline
+        description: Do not send any request that needs credentials.
+        type: boolean
+      - name: register
+        description: Also test dynamic client registration by registering and deleting a client.
+        type: boolean
+      - name: negative
+        description: Also send a request with a wrong client secret to check the error response.
+        type: boolean
+      - name: token
+        description: An access token to validate against the issuer, instead of obtaining one.
+        sensitive: true
+      - name: refresh-token
+        description: A refresh token to exercise the refresh_token grant with.
+        sensitive: true
+      - name: resource-url
+        description: A protected resource to check RFC 9728 metadata for; repeatable.
+        repeatable: true
+      - name: fail-on
+        description: "Exit 5 when a check of this level or worse exists: fail, warn."
+        choices: [fail, warn]
+        default: fail
+      - name: show
+        description: "Which checks to print: all, problems."
+        choices: [all, problems]
+        default: all
+      - name: label
+        description: Title for the report; defaults to the issuer.
+      - $ref: "#/components/flags/format-checklist"
+    examples:
+      - command: oauthcli check https://accounts.google.com
+        description: Anonymous audit of a public issuer.
+      - command: oauthcli check --profile dev --register --negative
+        description: Full audit with credentials, including the checks that create state.
+      - command: oauthcli check --format markdown > report.md
+        description: A report to paste into a pull request.
+      - command: oauthcli check --only rfc7636,oauth2.1 --format json
+        description: Just the PKCE and OAuth 2.1 checks, for a script.
+    output:
+      formatFlag: format
+      formats:
+        - format: checklist
+          default: true
+          description: Grouped checklist with a verdict per specification.
+        - format: table
+          description: One row per check.
+        - format: markdown
+          description: A Markdown report.
+        - format: plain
+          description: Tab-separated check rows.
+        - format: json
+          schema:
+            $ref: "#/components/schemas/ConformanceReport"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/ConformanceReport"
+
+  - name: skill
+    operationId: skill
+    aliases: [skills, guide, cookbook]
+    description: Print the usage guide for agents, with workflows and recipes.
+    longDescription: |
+      Prints a Markdown guide that explains how to use this tool to reach a
+      goal: discover an issuer, audit it, obtain a token, decode and assert on
+      it, run a browser or device login, and register a client. Read it before
+      running other commands.
+
+      `--full` appends a reference of every command, argument and flag,
+      generated from the same specification the commands are built from.
+      `--out DIR` writes the guide to DIR/SKILL.md so it can be installed as
+      an agent skill.
+    tags: [utilities]
+    arguments: []
+    flags:
+      - name: full
+        description: Append the complete command reference.
+        type: boolean
+      - name: out
+        short: o
+        description: Directory to write SKILL.md into, instead of printing.
+        type: path
+    examples:
+      - command: oauthcli skill
+        description: Read the guide.
+      - command: oauthcli skill --full --out .claude/skills/oauth
+        description: Install the guide as a project skill.
+
+  - name: reference
+    operationId: reference
+    aliases: [rfc, spec, docs]
+    description: Read the specifications the checks cite, embedded in the binary.
+    longDescription: |
+      Prints the verbatim text of an OAuth or OpenID specification, or the
+      list of the ones available. Every finding names a specification and a
+      section, and this command shows the sentence behind it without leaving
+      the terminal or the network.
+
+      SPEC is a specification id such as `rfc6749`, `6749`, `oauth2.1`,
+      `oidc-core`, `oidc-discovery` or `cimd`. `--section 5.2` prints that
+      section alone, including its subsections, with page headers removed.
+
+      The texts are reproduced unmodified under the IETF Trust Legal
+      Provisions and the OpenID Foundation's licence; their notices are part
+      of each document.
+    tags: [utilities]
+    arguments:
+      - name: SPEC
+        description: Specification to print. Without it the available specifications are listed.
+        placeholder: spec
+        required: false
+    flags:
+      - name: section
+        description: Print only this section and its subsections, e.g. 5.2 or 4.1.2.1.
+      - $ref: "#/components/flags/format-text-table"
+    examples:
+      - command: oauthcli reference
+        description: List the embedded specifications.
+      - command: oauthcli reference rfc6749 --section 5.2
+        description: Read the token endpoint error response rules.
+      - command: oauthcli reference oidc-core --section 3.1.3.7 | less
+        description: Read the ID token validation rules in a pager.
+    output:
+      formatFlag: format
+      formats:
+        - format: text
+          default: true
+          description: The specification text, or a list of specifications.
+        - format: table
+          description: One row per specification.
+        - format: plain
+          description: Tab-separated id, title and file, for scripts.
+        - format: json
+          schema:
+            $ref: "#/components/schemas/ReferenceList"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/ReferenceList"
+
+  - name: pkce
+    operationId: pkce
+    description: Generate a PKCE verifier and challenge (RFC 7636).
+    longDescription: |
+      Prints a code verifier and its S256 challenge, for assembling an
+      authorization request by hand. Pass `--verifier` to compute the
+      challenge of an existing verifier.
+    tags: [utilities]
+    arguments: []
+    flags:
+      - name: verifier
+        description: Compute the challenge for this verifier instead of generating one.
+      - name: length
+        description: Length of the generated verifier, 43 to 128.
+        type: integer
+        default: 64
+      - $ref: "#/components/flags/format-text-plain"
+    output:
+      formatFlag: format
+      formats:
+        - format: text
+          default: true
+        - format: plain
+          description: Verifier and challenge, tab-separated.
+        - format: json
+          schema:
+            $ref: "#/components/schemas/PkceResult"
+        - format: yaml
+          schema:
+            $ref: "#/components/schemas/PkceResult"
+
+  - name: config
+    aliases: [cfg]
+    description: Manage profiles in the configuration file.
+    tags: [setup]
+    commands:
+      - name: init
+        operationId: configInit
+        description: Create a profile, interactively by default.
+        longDescription: |
+          Writes a profile into the configuration file. With no flags it asks
+          for each setting in a form, offering the scopes and client
+          authentication methods the issuer actually advertises.
+
+          Pass `--non-interactive` to write a profile from flags alone.
+        arguments: []
+        flags:
+          - name: name
+            short: n
+            description: Profile name to create or replace.
+            default: default
+          - name: non-interactive
+            description: Do not prompt; take every value from flags.
+            type: boolean
+          - name: force
+            description: Replace the profile if it already exists.
+            type: boolean
+          - name: default
+            description: Make this the default profile.
+            type: boolean
+            default: true
+        examples:
+          - command: oauthcli config init
+            description: Set up a profile with the interactive form.
+          - command: oauthcli config init -n dev -i https://auth.example.com -c app --non-interactive
+            description: Write a profile without prompting.
+
+      - name: show
+        operationId: configShow
+        description: Show the settings a command would use.
+        arguments: []
+        flags:
+          - name: reveal
+            description: Show secrets in full.
+            type: boolean
+          - name: all
+            description: Show the whole configuration file rather than the resolved settings.
+            type: boolean
+          - $ref: "#/components/flags/format-text"
+
+      - name: list
+        operationId: configList
+        aliases: [ls]
+        description: List the configured profiles.
+        arguments: []
+        flags:
+          - $ref: "#/components/flags/format-table"
+        output:
+          formatFlag: format
+          formats:
+            - format: table
+              default: true
+            - format: plain
+            - format: json
+              schema:
+                $ref: "#/components/schemas/ProfileList"
+            - format: yaml
+              schema:
+                $ref: "#/components/schemas/ProfileList"
+
+      - name: use
+        operationId: configUse
+        description: Make a profile the default.
+        arguments:
+          - name: NAME
+            description: Profile to make the default.
+            placeholder: profile
+            required: true
+
+      - name: set
+        operationId: configSet
+        description: Change one setting of a profile.
+        longDescription: |
+          Sets a dotted key on the active profile, or on `--name`. Keys are
+          `issuer`, `client.id`, `client.secret`, `client.secretFile`,
+          `client.key`, `client.authMethod`, `scopes`, `redirectUri`,
+          `audience`, `resources`, `insecure`, `allowHttp` and `description`.
+        arguments:
+          - name: SETTING
+            description: Dotted key to set, e.g. client.id.
+            placeholder: key
+            required: true
+          - name: VALUE
+            description: New value. Lists are comma-separated.
+            placeholder: value
+            required: true
+        flags:
+          - name: name
+            short: n
+            description: Profile to change; defaults to the active profile.
+
+      - name: remove
+        operationId: configRemove
+        aliases: [rm]
+        description: Delete a profile and its saved token.
+        arguments:
+          - name: NAME
+            description: Profile to delete.
+            placeholder: profile
+            required: true
+        flags:
+          - name: yes
+            short: y
+            description: Skip the confirmation prompt.
+            type: boolean
+
+      - name: path
+        operationId: configPath
+        description: Print the location of the configuration file.
+        arguments: []
+
+components:
+  arguments:
+    issuer-url:
+      name: ISSUER_URL
+      description: Issuer URL. Defaults to the issuer of the active profile or --issuer.
+      placeholder: url
+      required: false
+    token:
+      name: TOKEN
+      description: The token, or - to read it from stdin. Defaults to the saved token of the profile.
+      placeholder: token
+      required: false
+      sensitive: true
+
+  flags:
+    format-text:
+      name: format
+      short: f
+      description: "Output format: text, json, yaml."
+      choices: [text, json, yaml]
+      default: text
+    format-text-plain:
+      name: format
+      short: f
+      description: "Output format: text, plain, json, yaml."
+      choices: [text, plain, json, yaml]
+      default: text
+    format-text-table:
+      name: format
+      short: f
+      description: "Output format: text, table, plain, json, yaml."
+      choices: [text, table, plain, json, yaml]
+      default: text
+    format-text-markdown:
+      name: format
+      short: f
+      description: "Output format: text, markdown, json, yaml."
+      choices: [text, markdown, json, yaml]
+      default: text
+    format-table:
+      name: format
+      short: f
+      description: "Output format: table, plain, json, yaml."
+      choices: [table, plain, json, yaml]
+      default: table
+    format-checklist:
+      name: format
+      short: f
+      description: "Output format: checklist, table, markdown, plain, json, yaml."
+      choices: [checklist, table, markdown, plain, json, yaml]
+      default: checklist
+    registration-uri:
+      name: registration-uri
+      description: The registration_client_uri of the client; defaults to the one saved in the profile.
+      placeholder: URL
+    registration-token:
+      name: registration-token
+      description: The registration_access_token of the client; defaults to the one saved in the profile.
+      sensitive: true
+      envVar: OAUTH_REGISTRATION_TOKEN
+
+  schemas:
+    Document:
+      type: object
+      description: A JSON document exactly as the server sent it.
+      additionalProperties: true
+
+    Issue:
+      type: object
+      description: One validation finding.
+      required: [severity, code, message]
+      properties:
+        severity:
+          type: string
+          enum: [error, warning, info]
+        code:
+          type: string
+          description: Stable identifier of the rule, e.g. issuer-mismatch.
+        message:
+          type: string
+        field:
+          type: string
+          description: The metadata member or claim the finding is about.
+        spec:
+          type: string
+          description: The specification and section that defines the rule.
+
+    Capability:
+      type: object
+      description: One feature an authorization server can advertise.
+      required: [id, title, spec, supported]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        spec:
+          type: string
+        supported:
+          type: boolean
+        detail:
+          type: string
+          description: The advertised value that decided support.
+
+    WellKnownProbe:
+      type: object
+      description: The outcome of fetching one well-known location.
+      required: [kind, url, status, elapsedMs]
+      properties:
+        kind:
+          type: string
+          description: Which document the location serves.
+        spec:
+          type: string
+        url:
+          type: string
+        status:
+          type: string
+          enum: [found, missing, error]
+        httpStatus:
+          type: integer
+        contentType:
+          type: string
+        elapsedMs:
+          type: integer
+        error:
+          type: string
+        summary:
+          type: string
+          description: A one-line description of what was found.
+
+    DiscoveryReport:
+      type: object
+      required: [issuer, probes, capabilities, issues]
+      properties:
+        issuer:
+          type: string
+        probes:
+          type: array
+          items:
+            $ref: "#/components/schemas/WellKnownProbe"
+        metadata:
+          $ref: "#/components/schemas/Document"
+        resource:
+          $ref: "#/components/schemas/Document"
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/Jwk"
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/Capability"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    Endpoint:
+      type: object
+      required: [name, url]
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+
+    MetadataReport:
+      type: object
+      required: [url, issuer, kind, metadata, endpoints, capabilities, issues]
+      properties:
+        url:
+          type: string
+          description: The well-known URL the document was fetched from.
+        issuer:
+          type: string
+        kind:
+          type: string
+          enum: [oauth-authorization-server, openid-configuration]
+        httpStatus:
+          type: integer
+        elapsedMs:
+          type: integer
+        metadata:
+          $ref: "#/components/schemas/Document"
+        endpoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Endpoint"
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/Capability"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    CertificateInfo:
+      type: object
+      required: [subject, issuer, notBefore, notAfter, expired]
+      properties:
+        subject:
+          type: string
+        issuer:
+          type: string
+        notBefore:
+          type: string
+          format: date-time
+        notAfter:
+          type: string
+          format: date-time
+        expired:
+          type: boolean
+        serialNumber:
+          type: string
+
+    Jwk:
+      type: object
+      description: One key of a JSON Web Key Set.
+      required: [kty, thumbprint, issues]
+      properties:
+        kid:
+          type: string
+        kty:
+          type: string
+        alg:
+          type: string
+        use:
+          type: string
+        crv:
+          type: string
+        bits:
+          type: integer
+          description: Key size in bits.
+        thumbprint:
+          type: string
+          description: RFC 7638 SHA-256 thumbprint.
+        pem:
+          type: string
+          description: The public key in PEM form, when requested.
+        certificate:
+          $ref: "#/components/schemas/CertificateInfo"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    KeySet:
+      type: object
+      required: [url, keys, issues]
+      properties:
+        url:
+          type: string
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/Jwk"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    Challenge:
+      type: object
+      description: A decoded WWW-Authenticate challenge.
+      required: [scheme, params]
+      properties:
+        scheme:
+          type: string
+        params:
+          type: object
+          additionalProperties:
+            type: string
+        httpStatus:
+          type: integer
+
+    ResourceReport:
+      type: object
+      required: [url, metadataUrl, metadata, authorizationServers, issues]
+      properties:
+        url:
+          type: string
+        metadataUrl:
+          type: string
+        resource:
+          type: string
+        metadata:
+          $ref: "#/components/schemas/Document"
+        authorizationServers:
+          type: array
+          items:
+            type: string
+        challenge:
+          $ref: "#/components/schemas/Challenge"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    Signature:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [verified, invalid, unverified, unsigned]
+        alg:
+          type: string
+        kid:
+          type: string
+        keySource:
+          type: string
+          description: Where the verification key came from.
+        error:
+          type: string
+
+    Timing:
+      type: object
+      required: [expired]
+      properties:
+        issuedAt:
+          type: string
+          format: date-time
+        notBefore:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        expiresIn:
+          type: string
+          description: Remaining lifetime, negative when expired.
+        lifetime:
+          type: string
+          description: Total lifetime from iat to exp.
+        expired:
+          type: boolean
+        notYetValid:
+          type: boolean
+
+    TokenInfo:
+      type: object
+      required: [kind, issues]
+      properties:
+        kind:
+          type: string
+          enum: [jwt, opaque]
+        header:
+          $ref: "#/components/schemas/Document"
+        claims:
+          $ref: "#/components/schemas/Document"
+        signature:
+          $ref: "#/components/schemas/Signature"
+        timing:
+          $ref: "#/components/schemas/Timing"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    TokenResponse:
+      type: object
+      required: [tokenType, accessToken, raw, issues]
+      properties:
+        tokenType:
+          type: string
+        accessToken:
+          type: string
+        expiresIn:
+          type: integer
+        expiresAt:
+          type: string
+          format: date-time
+        refreshToken:
+          type: string
+        idToken:
+          type: string
+        scope:
+          type: string
+        raw:
+          $ref: "#/components/schemas/Document"
+        accessTokenInfo:
+          $ref: "#/components/schemas/TokenInfo"
+        idTokenInfo:
+          $ref: "#/components/schemas/TokenInfo"
+        dpopThumbprint:
+          type: string
+          description: Thumbprint of the DPoP key the token is bound to.
+        saved:
+          type: boolean
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    IntrospectionReport:
+      type: object
+      required: [endpoint, active, response, issues]
+      properties:
+        endpoint:
+          type: string
+        active:
+          type: boolean
+        response:
+          $ref: "#/components/schemas/Document"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    RevocationReport:
+      type: object
+      required: [endpoint, ok, httpStatus, issues]
+      properties:
+        endpoint:
+          type: string
+        ok:
+          type: boolean
+        httpStatus:
+          type: integer
+        verifiedInactive:
+          type: boolean
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    UserInfoReport:
+      type: object
+      required: [endpoint, claims, issues]
+      properties:
+        endpoint:
+          type: string
+        sub:
+          type: string
+        claims:
+          $ref: "#/components/schemas/Document"
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    Expectation:
+      type: object
+      required: [rule, ok]
+      properties:
+        rule:
+          type: string
+        ok:
+          type: boolean
+        expected:
+          type: string
+        actual:
+          type: string
+
+    ExpectationReport:
+      type: object
+      required: [passed, checks, token]
+      properties:
+        passed:
+          type: boolean
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Expectation"
+        token:
+          $ref: "#/components/schemas/TokenInfo"
+
+    RegistrationReport:
+      type: object
+      required: [endpoint, clientId, response, issues]
+      properties:
+        endpoint:
+          type: string
+        clientId:
+          type: string
+        clientSecret:
+          type: string
+        clientSecretExpiresAt:
+          type: string
+          format: date-time
+        registrationClientUri:
+          type: string
+        registrationAccessToken:
+          type: string
+        response:
+          $ref: "#/components/schemas/Document"
+        saved:
+          type: boolean
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    CimdReport:
+      type: object
+      required: [url, document, issues]
+      properties:
+        url:
+          type: string
+        document:
+          $ref: "#/components/schemas/Document"
+        serverSupport:
+          type: boolean
+          description: Whether the configured issuer advertises support, when one is configured.
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/Issue"
+
+    PkceResult:
+      type: object
+      required: [verifier, challenge, method]
+      properties:
+        verifier:
+          type: string
+        challenge:
+          type: string
+        method:
+          type: string
+
+    Check:
+      type: object
+      description: One conformance check.
+      required: [id, title, status]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+          enum: [pass, fail, warn, skip, untested]
+        spec:
+          type: string
+        section:
+          type: string
+        detail:
+          type: string
+        evidence:
+          $ref: "#/components/schemas/Document"
+
+    SpecResult:
+      type: object
+      description: Every check for one specification and its overall verdict.
+      required: [id, title, verdict, checks]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        url:
+          type: string
+        verdict:
+          type: string
+          enum: [conformant, non-conformant, not-supported, not-tested]
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Check"
+
+    Summary:
+      type: object
+      required:
+        [
+          pass,
+          fail,
+          warn,
+          skip,
+          untested,
+          conformant,
+          nonConformant,
+          notSupported,
+          notTested,
+        ]
+      properties:
+        pass:
+          type: integer
+        fail:
+          type: integer
+        warn:
+          type: integer
+        skip:
+          type: integer
+        untested:
+          type: integer
+        conformant:
+          type: integer
+        nonConformant:
+          type: integer
+        notSupported:
+          type: integer
+        notTested:
+          type: integer
+
+    ConformanceReport:
+      type: object
+      required: [issuer, startedAt, elapsedMs, passed, summary, specs]
+      properties:
+        issuer:
+          type: string
+        label:
+          type: string
+        startedAt:
+          type: string
+          format: date-time
+        elapsedMs:
+          type: integer
+        passed:
+          type: boolean
+        credentials:
+          type: boolean
+          description: Whether the audit had client credentials to use.
+        summary:
+          $ref: "#/components/schemas/Summary"
+        specs:
+          type: array
+          items:
+            $ref: "#/components/schemas/SpecResult"
+
+    Profile:
+      type: object
+      required: [name, isDefault, issuer, hasSecret]
+      properties:
+        name:
+          type: string
+        isDefault:
+          type: boolean
+        description:
+          type: string
+        issuer:
+          type: string
+        clientId:
+          type: string
+        authMethod:
+          type: string
+        hasSecret:
+          type: boolean
+        scopes:
+          type: array
+          items:
+            type: string
+        redirectUri:
+          type: string
+        audience:
+          type: string
+        hasToken:
+          type: boolean
+
+    ProfileList:
+      type: array
+      items:
+        $ref: "#/components/schemas/Profile"
+
+    TokenStatus:
+      type: object
+      required: [profile, expired, hasRefreshToken, hasIdToken, dpop]
+      properties:
+        profile:
+          type: string
+        issuer:
+          type: string
+        clientId:
+          type: string
+        tokenType:
+          type: string
+        scope:
+          type: string
+        subject:
+          type: string
+        obtainedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        expiresIn:
+          type: string
+        expired:
+          type: boolean
+        hasRefreshToken:
+          type: boolean
+        hasIdToken:
+          type: boolean
+        dpop:
+          type: boolean
+
+    TokenStatusList:
+      type: array
+      items:
+        $ref: "#/components/schemas/TokenStatus"
+
+    Reference:
+      type: object
+      description: One embedded specification, with its text when one was requested.
+      required: [id, title, file, url, bytes]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        file:
+          type: string
+        url:
+          type: string
+        bytes:
+          type: integer
+        section:
+          type: string
+        text:
+          type: string
+
+    ReferenceList:
+      type: array
+      items:
+        $ref: "#/components/schemas/Reference"
