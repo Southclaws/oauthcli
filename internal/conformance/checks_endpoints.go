@@ -93,16 +93,6 @@ func (p authorizeProbe) summary() string {
 	return fmt.Sprintf("HTTP %d redirect to %s", p.Status, target.String())
 }
 
-// probeRedirectURI is the redirect URI used for authorization probes: the
-// configured one, or a loopback default that a registered client is likely
-// to accept.
-func (r *Runner) probeRedirectURI() string {
-	if r.Options.RedirectURI != "" {
-		return r.Options.RedirectURI
-	}
-	return "http://127.0.0.1/callback"
-}
-
 // registeredErrorCodes are the token endpoint error codes RFC 6749 §5.2
 // defines.
 var registeredErrorCodes = []string{"invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope"}
@@ -115,6 +105,30 @@ func oauthErrorOf(err error) (*oauth.Error, bool) {
 		return oauthErr, true
 	}
 	return nil, false
+}
+
+func (r *Runner) checkAuthorizationErrorRedirect(ctx context.Context, s *Spec) {
+	if r.clientID() == "" || r.Options.RedirectURI == "" {
+		s.untested("error-redirect", "unsupported response type is reported to the redirect URI with state", "§3.1.1, §4.1.2.1", "needs --client-id and a registered --redirect-uri")
+		return
+	}
+	state := oauth.NewState()
+	echo := r.probeAuthorize(ctx, url.Values{
+		"response_type": {"oauthcli-invalid"},
+		"client_id":     {r.clientID()},
+		"redirect_uri":  {r.Options.RedirectURI},
+		"state":         {state},
+	}, r.Options.RedirectURI, nil)
+	switch {
+	case echo.Err != nil:
+		s.untested("error-redirect", "unsupported response type is reported to the redirect URI with state", "§3.1.1, §4.1.2.1", echo.Err.Error())
+	case echo.ToClient && (echo.Error == "unsupported_response_type" || echo.Error == "invalid_request") && echo.State == state:
+		s.pass("error-redirect", "unsupported response type is reported to the redirect URI with state", "§3.1.1, §4.1.2.1", echo.summary())
+	case echo.ToClient && echo.Error != "":
+		s.warn("error-redirect", "unsupported response type is reported to the redirect URI with state", "§3.1.1, §4.1.2.1", fmt.Sprintf("redirected with error=%s and state echoed=%t", echo.Error, echo.State == state))
+	default:
+		s.untested("error-redirect", "unsupported response type is reported to the redirect URI with state", "§3.1.1, §4.1.2.1", "no error redirect: "+echo.summary()+"; the redirect URI may not be registered for this client")
+	}
 }
 
 func (r *Runner) checkCore(ctx context.Context) {
@@ -146,6 +160,8 @@ func (r *Runner) checkCore(ctx context.Context) {
 		anonymous, err := r.Client.PostForm(ctx, tokenEndpoint, url.Values{"grant_type": {oauth.GrantClientCredentials}}, nil)
 		if err == nil {
 			s.requirement(anonymous.Status >= 400, Fail, "client-credentials-authenticated", "client credentials grant without client authentication is refused", "§4.4.2, §3.2.1", fmt.Sprintf("HTTP %d %s", anonymous.Status, oauth.ParseError(anonymous).Code), fmt.Sprintf("HTTP %d: a token may have been issued to an unauthenticated caller", anonymous.Status))
+		} else {
+			s.untested("client-credentials-authenticated", "client credentials grant without client authentication is refused", "§4.4.2, §3.2.1", describeErr(err))
 		}
 	}
 
@@ -156,21 +172,15 @@ func (r *Runner) checkCore(ctx context.Context) {
 			s.untested("authz-bad-request", "authorization endpoint handles a request with no parameters", "§3.1.1, §4.1.2.1", probe.Err.Error())
 		case probe.Status == 405:
 			s.fail("authz-bad-request", "authorization endpoint handles a request with no parameters", "§3.1", "HTTP 405; the authorization endpoint must support GET")
+		case probe.Status == 404:
+			s.fail("authz-bad-request", "authorization endpoint handles a request with no parameters", "§3.1", "HTTP 404 from the advertised authorization endpoint")
 		case probe.Status >= 500:
 			s.fail("authz-bad-request", "authorization endpoint handles a request with no parameters", "§3.1.1, §4.1.2.1", fmt.Sprintf("HTTP %d; a request without response_type must produce an error response, not a server failure", probe.Status))
-		case probe.Location != nil && probe.Status >= 300 && probe.Status < 400 && probe.Error == "":
-			s.warn("authz-bad-request", "authorization endpoint handles a request with no parameters", "§4.1.2.1", "the server redirected a request with no client_id and no redirect_uri: "+probe.summary())
 		default:
 			s.pass("authz-bad-request", "authorization endpoint handles a request with no parameters", "§3.1.1, §4.1.2.1", probe.summary())
 		}
 
-		// OAuth 2.1 §3.1: CORS must not be supported at the authorization
-		// endpoint, because it is meant for the browser's navigation only.
-		cors := r.probeAuthorize(ctx, url.Values{}, "", http.Header{"Origin": {"https://oauthcli.invalid"}})
-		if cors.Err == nil {
-			allow := cors.Header.Get("Access-Control-Allow-Origin")
-			s.requirement(allow == "", Fail, "authz-no-cors", "authorization endpoint does not answer CORS requests", "OAuth 2.1 §3.1", "", fmt.Sprintf("Access-Control-Allow-Origin: %s", allow))
-		}
+		r.checkAuthorizationErrorRedirect(ctx, s)
 	}
 
 	if !r.hasCredentials() {
@@ -184,12 +194,14 @@ func (r *Runner) checkCore(ctx context.Context) {
 	result, err := r.obtainToken(ctx, nil)
 	if err != nil {
 		if oauthErr, ok := oauthErrorOf(err); ok {
-			r.clientRecognised = oauthErr.Code != "invalid_client"
-			if oauthErr.Code == "invalid_client" || oauthErr.Code == "unauthorized_client" {
+			switch oauthErr.Code {
+			case "invalid_client", "unauthorized_client":
 				r.grantUnavailable = "the client credentials grant is not available to this client (" + oauthErr.Code + ")"
 				s.untested("client-credentials", "client credentials grant issues a token", "§4.4", "the server refused the credentials given: "+oauthErr.Error()+"; check the client id, secret and --auth-method")
-			} else {
-				s.fail("client-credentials", "client credentials grant issues a token", "§4.4", "the server answered "+oauthErr.Error())
+			case "unsupported_grant_type":
+				s.fail("client-credentials", "client credentials grant issues a token", "§4.4", "client_credentials is advertised, but the token endpoint answered "+oauthErr.Error())
+			default:
+				s.untested("client-credentials", "client credentials grant issues a token", "§4.4", "the configured client or request was refused, so token response conformance could not be checked: "+oauthErr.Error())
 			}
 		} else {
 			s.untested("client-credentials", "client credentials grant issues a token", "§4.4", describeErr(err))
@@ -316,7 +328,7 @@ func (r *Runner) checkCore(ctx context.Context) {
 			s.untested("invalid-client", "wrong client secret is rejected with invalid_client", "§5.2", describeErr(err))
 		}
 	} else {
-		s.skip("invalid-client", "wrong client secret is rejected with invalid_client", "§5.2", "pass --negative to send a wrong secret")
+		s.untested("invalid-client", "wrong client secret is rejected with invalid_client", "§5.2", "pass --negative to send a wrong secret")
 	}
 
 	if r.Options.RefreshToken != "" && contains(r.Metadata.GrantTypes(), oauth.GrantRefreshToken) {
@@ -376,34 +388,14 @@ func (r *Runner) checkPKCE(ctx context.Context) {
 
 	clientID := r.clientID()
 	authorize := r.Metadata.String("authorization_endpoint")
-	if clientID == "" || authorize == "" {
-		s.untested("enforced", "authorization request without PKCE is rejected", "OAuth 2.1 §4.1.2.1, §7.5.1.1", "needs --client-id to send a probe")
+	if clientID == "" || authorize == "" || r.Options.RedirectURI == "" {
+		s.untested("unsupported-method", "unknown code_challenge_method is rejected with invalid_request", "§4.4.1", "needs --client-id and a registered --redirect-uri")
 		return
-	}
-	redirect := r.probeRedirectURI()
-	probe := r.probeAuthorize(ctx, url.Values{
-		"response_type": {"code"},
-		"client_id":     {clientID},
-		"redirect_uri":  {redirect},
-		"state":         {oauth.NewState()},
-		"scope":         {strings.Join(r.Options.Scopes, " ")},
-	}, redirect, nil)
-	const enforcedSection = "OAuth 2.1 §4.1.2.1, §7.5.1.1"
-	switch {
-	case probe.Err != nil:
-		s.untested("enforced", "authorization request without PKCE is rejected", enforcedSection, probe.Err.Error())
-	case probe.ToClient && probe.Error != "":
-		s.pass("enforced", "authorization request without PKCE is rejected", enforcedSection, probe.summary())
-	case probe.Status == 400 || probe.Status == 401:
-		s.untested("enforced", "authorization request without PKCE is rejected", enforcedSection, probe.summary()+"; the client or the redirect URI "+redirect+" may be unknown to the server, so this says nothing about PKCE")
-	case probe.Status == 200 || (probe.Status >= 300 && probe.Status < 400 && !probe.ToClient):
-		s.warn("enforced", "authorization request without PKCE is rejected", enforcedSection, "the request proceeded to a login page ("+probe.summary()+"); PKCE is not enforced at the authorization endpoint, though OAuth 2.1 permits confidential clients to omit it and a server may enforce it at the token endpoint")
-	default:
-		s.warn("enforced", "authorization request without PKCE is rejected", enforcedSection, probe.summary())
 	}
 
 	// RFC 7636 §4.4.1: an unsupported transformation must be rejected with
 	// invalid_request.
+	redirect := r.Options.RedirectURI
 	unsupported := r.probeAuthorize(ctx, url.Values{
 		"response_type":         {"code"},
 		"client_id":             {clientID},
@@ -419,26 +411,120 @@ func (r *Runner) checkPKCE(ctx context.Context) {
 		s.pass("unsupported-method", "unknown code_challenge_method is rejected with invalid_request", "§4.4.1", unsupported.summary())
 	case unsupported.ToClient && unsupported.Error != "":
 		s.warn("unsupported-method", "unknown code_challenge_method is rejected with invalid_request", "§4.4.1", "rejected with error="+unsupported.Error+" instead of invalid_request")
-	case unsupported.Status == 400 || unsupported.Status == 401:
+	case unsupported.Status == 400 || unsupported.Status == 401 || (unsupported.Location != nil && !unsupported.ToClient):
 		s.untested("unsupported-method", "unknown code_challenge_method is rejected with invalid_request", "§4.4.1", unsupported.summary()+"; the client or redirect URI may be unknown to the server")
-	default:
+	case unsupported.Status == 200:
 		s.fail("unsupported-method", "unknown code_challenge_method is rejected with invalid_request", "§4.4.1", "the request proceeded: "+unsupported.summary())
+	default:
+		s.untested("unsupported-method", "unknown code_challenge_method is rejected with invalid_request", "§4.4.1", unsupported.summary())
+	}
+}
+
+func (r *Runner) checkOAuth21CORS(ctx context.Context, s *Spec) {
+	if r.Metadata.String("authorization_endpoint") == "" {
+		return
+	}
+	cors := r.probeAuthorize(ctx, url.Values{}, "", http.Header{"Origin": {"https://oauthcli.invalid"}})
+	if cors.Err != nil {
+		s.untested("authz-no-cors", "authorization endpoint does not support CORS", "§3.1", cors.Err.Error())
+		return
+	}
+	allow := cors.Header.Get("Access-Control-Allow-Origin")
+	s.requirement(allow == "", Fail, "authz-no-cors", "authorization endpoint does not support CORS", "§3.1", "no Access-Control-Allow-Origin header", fmt.Sprintf("Access-Control-Allow-Origin: %s", allow))
+}
+
+func (r *Runner) checkOAuth21Authorization(ctx context.Context, s *Spec) {
+	const pkceSection = "§4.1.2.1, §7.5.1.1"
+	const redirectSection = "§2.3.1, §4.1.1; RFC 6749 §4.1.2.1"
+	clientID := r.clientID()
+	if clientID == "" || r.Metadata.String("authorization_endpoint") == "" || r.Options.RedirectURI == "" {
+		detail := "needs --client-id and a registered --redirect-uri"
+		s.untested("pkce-enforced", "authorization request without PKCE is rejected", pkceSection, detail)
+		s.untested("redirect-exact", "redirect URI is matched exactly", redirectSection, detail)
+		return
+	}
+
+	registered := r.Options.RedirectURI
+	pkce := r.probeAuthorize(ctx, url.Values{
+		"response_type": {"code"},
+		"client_id":     {clientID},
+		"redirect_uri":  {registered},
+		"state":         {oauth.NewState()},
+		"scope":         {strings.Join(r.Options.Scopes, " ")},
+	}, registered, nil)
+	switch {
+	case pkce.Err != nil:
+		s.untested("pkce-enforced", "authorization request without PKCE is rejected", pkceSection, pkce.Err.Error())
+	case pkce.ToClient && pkce.Error != "":
+		s.pass("pkce-enforced", "authorization request without PKCE is rejected", pkceSection, pkce.summary())
+	case pkce.Status == 400 || pkce.Status == 401 || (pkce.Location != nil && !pkce.ToClient):
+		s.untested("pkce-enforced", "authorization request without PKCE is rejected", pkceSection, pkce.summary()+"; the client or redirect URI may be unknown, so this does not establish PKCE behavior")
+	case pkce.Status == 200:
+		s.warn("pkce-enforced", "authorization request without PKCE is rejected", pkceSection, "the request proceeded to a login page; OAuth 2.1 permits confidential clients to omit PKCE and a server may enforce it at the token endpoint")
+	default:
+		s.untested("pkce-enforced", "authorization request without PKCE is rejected", pkceSection, pkce.summary())
+	}
+
+	// Sending an unsupported response type with a derived redirect URI is
+	// conclusive: a server that accepts the derived URI redirects to it with
+	// unsupported_response_type, while an exact matcher never follows it.
+	bogus := strings.TrimRight(registered, "/") + "/oauthcli-open-redirect-probe"
+	probe := r.probeAuthorize(ctx, url.Values{
+		"response_type": {"oauthcli-invalid"},
+		"client_id":     {clientID},
+		"redirect_uri":  {bogus},
+		"state":         {oauth.NewState()},
+	}, bogus, nil)
+	switch {
+	case probe.Err != nil:
+		s.untested("redirect-exact", "redirect URI is matched exactly", redirectSection, probe.Err.Error())
+	case probe.ToClient:
+		s.fail("redirect-exact", "redirect URI is matched exactly", redirectSection, "the server redirected to an unregistered URI derived from the registered one: "+probe.summary())
+	default:
+		s.pass("redirect-exact", "redirect URI is matched exactly", redirectSection, "an unregistered redirect URI was not followed: "+probe.summary())
+	}
+}
+
+func (r *Runner) checkOAuth21QueryToken(ctx context.Context, s *Spec) {
+	userinfo := r.Metadata.String("userinfo_endpoint")
+	token := r.Options.Token
+	if token == "" && r.Obtained != nil {
+		token = r.Obtained.AccessToken
+	}
+	if token == "" {
+		s.untested("no-query-token", "a token in the query string is rejected by the resource server", "§5.1", "needs credentials or --token")
+		return
+	}
+	if userinfo == "" {
+		s.untested("no-query-token", "a token in the query string is rejected by the resource server", "§5.1", "no protected endpoint is advertised to probe")
+		return
+	}
+	target := userinfo
+	if strings.Contains(target, "?") {
+		target += "&access_token=" + url.QueryEscape(token)
+	} else {
+		target += "?access_token=" + url.QueryEscape(token)
+	}
+	if response, err := r.Client.Get(ctx, target); err != nil {
+		s.untested("no-query-token", "a token in the query string is rejected by the resource server", "§5.1", describeErr(err))
+	} else {
+		s.requirement(response.Status != 200, Fail, "no-query-token", "a token in the query string is rejected by the resource server", "§5.1", fmt.Sprintf("HTTP %d", response.Status), "the UserInfo endpoint accepted an access token from the query string")
 	}
 }
 
 func (r *Runner) checkOAuth21(ctx context.Context) {
-	s := r.spec("oauth2.1", "OAuth 2.1 (draft-ietf-oauth-v2-1)", "https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1")
+	s := r.spec("oauth2.1", "OAuth 2.1 (draft-ietf-oauth-v2-1-15)", "https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-15")
 	if r.Metadata == nil {
 		s.untested("grants", "removed grant types are not offered", "", "no metadata document")
 		return
 	}
 	s.supportedIf(true, "")
 	grants := r.Metadata.GrantTypes()
-	if r.Metadata.Has("grant_types_supported") {
-		s.requirement(!contains(grants, "implicit"), Warn, "no-implicit", "implicit grant is not offered", "§10.1, RFC 9700 §2.1.2", "", "grant_types_supported includes implicit, which OAuth 2.1 omits and RFC 9700 says clients should not use")
-	} else {
-		s.skip("no-implicit", "implicit grant is not offered", "§10.1", "grant_types_supported is absent, so the RFC 8414 default applies and nothing was advertised")
+	implicitDetail := "grant_types_supported includes implicit, which OAuth 2.1 omits and RFC 9700 says clients should not use"
+	if !r.Metadata.Has("grant_types_supported") {
+		implicitDetail = "grant_types_supported is absent, so RFC 8414 applies its default of authorization_code and implicit"
 	}
+	s.requirement(!contains(grants, "implicit"), Warn, "no-implicit", "implicit grant is not offered", "§10.1, RFC 9700 §2.1.2", "", implicitDetail)
 	s.requirement(!contains(grants, "password"), Fail, "no-password", "password grant is not offered", "§10.1, RFC 9700 §2.4", "", "grant_types_supported includes password, which RFC 9700 says must not be used")
 	implicitResponse := false
 	for _, responseType := range r.Metadata.Strings("response_types_supported") {
@@ -456,63 +542,9 @@ func (r *Runner) checkOAuth21(ctx context.Context) {
 	default:
 		s.pass("pkce", "PKCE with S256 is advertised", "§4.1.1", strings.Join(methods, ", "))
 	}
-	if r.Metadata.Has("grant_types_supported") {
-		s.pass("grants-advertised", "grant_types_supported is advertised", "RFC 8414 §2", strings.Join(grants, ", "))
-	} else {
-		s.warn("grants-advertised", "grant_types_supported is advertised", "RFC 8414 §2", "absent, so the default of authorization_code and implicit applies")
-	}
 
-	clientID := r.clientID()
-	authorize := r.Metadata.String("authorization_endpoint")
-	const redirectSection = "§2.3.1, §4.1.1; RFC 6749 §4.1.2.1"
-	if clientID == "" || authorize == "" {
-		s.untested("redirect-exact", "redirect URI is matched exactly", redirectSection, "needs --client-id to send a probe")
-	} else {
-		// RFC 6749 §4.1.2.1: an invalid redirect URI must never be redirected
-		// to, while §3.1.1 says an unsupported response type is reported by
-		// redirecting to a valid one. Sending both together makes the probe
-		// conclusive: a server that accepts the derived URI reveals it by
-		// redirecting there with unsupported_response_type.
-		registered := r.probeRedirectURI()
-		bogus := strings.TrimRight(registered, "/") + "/oauthcli-open-redirect-probe"
-		probe := r.probeAuthorize(ctx, url.Values{
-			"response_type": {"oauthcli-invalid"},
-			"client_id":     {clientID},
-			"redirect_uri":  {bogus},
-			"state":         {oauth.NewState()},
-		}, bogus, nil)
-		switch {
-		case probe.Err != nil:
-			s.untested("redirect-exact", "redirect URI is matched exactly", redirectSection, probe.Err.Error())
-		case probe.ToClient:
-			s.fail("redirect-exact", "redirect URI is matched exactly", redirectSection, "the server redirected to an unregistered URI derived from the registered one: "+probe.summary())
-		default:
-			s.pass("redirect-exact", "redirect URI is matched exactly", redirectSection, "an unregistered redirect URI was not followed: "+probe.summary())
-		}
-
-		// RFC 6749 §3.1.1 and §4.1.2.1: an unsupported response type is
-		// reported to the registered redirect URI, with state echoed. Only a
-		// redirect URI the user configured can be relied on to be registered.
-		if r.Options.RedirectURI != "" {
-			state := oauth.NewState()
-			echo := r.probeAuthorize(ctx, url.Values{
-				"response_type": {"oauthcli-invalid"},
-				"client_id":     {clientID},
-				"redirect_uri":  {registered},
-				"state":         {state},
-			}, registered, nil)
-			switch {
-			case echo.Err != nil:
-				s.untested("error-redirect", "unsupported response type is reported to the redirect URI with state", "RFC 6749 §3.1.1, §4.1.2.1", echo.Err.Error())
-			case echo.ToClient && (echo.Error == "unsupported_response_type" || echo.Error == "invalid_request") && echo.State == state:
-				s.pass("error-redirect", "unsupported response type is reported to the redirect URI with state", "RFC 6749 §3.1.1, §4.1.2.1", echo.summary())
-			case echo.ToClient && echo.Error != "":
-				s.warn("error-redirect", "unsupported response type is reported to the redirect URI with state", "RFC 6749 §3.1.1, §4.1.2.1", fmt.Sprintf("redirected with error=%s and state echoed=%t", echo.Error, echo.State == state))
-			default:
-				s.warn("error-redirect", "unsupported response type is reported to the redirect URI with state", "RFC 6749 §3.1.1, §4.1.2.1", "no error redirect: "+echo.summary()+" (the redirect URI may not be registered for this client)")
-			}
-		}
-	}
+	r.checkOAuth21CORS(ctx, s)
+	r.checkOAuth21Authorization(ctx, s)
 
 	if r.refreshed != nil {
 		rotated := r.refreshed.RefreshToken != "" && r.refreshed.RefreshToken != r.Options.RefreshToken
@@ -521,20 +553,7 @@ func (r *Runner) checkOAuth21(ctx context.Context) {
 		s.untested("refresh-rotation", "refresh tokens rotate on use", "§4.3.1", "pass --refresh-token to test rotation")
 	}
 
-	if r.Obtained != nil {
-		s.pass("bearer-header", "access tokens are usable in the Authorization header", "§5.1.1", "token_type="+r.Obtained.TokenType)
-		if userinfo := r.Metadata.String("userinfo_endpoint"); userinfo != "" {
-			target := userinfo
-			if strings.Contains(target, "?") {
-				target += "&access_token=" + url.QueryEscape(r.Obtained.AccessToken)
-			} else {
-				target += "?access_token=" + url.QueryEscape(r.Obtained.AccessToken)
-			}
-			if response, err := r.Client.Get(ctx, target); err == nil {
-				s.requirement(response.Status != 200, Fail, "no-query-token", "a token in the query string is ignored by the resource server", "§5.1", fmt.Sprintf("HTTP %d", response.Status), "the UserInfo endpoint accepted an access token from the query string")
-			}
-		}
-	}
+	r.checkOAuth21QueryToken(ctx, s)
 }
 
 func (r *Runner) checkBearer(ctx context.Context) {
@@ -614,6 +633,10 @@ func (r *Runner) checkOpenIDCore(ctx context.Context) {
 	algs := source.Strings("id_token_signing_alg_values_supported")
 	s.requirement(!contains(algs, "none") || len(algs) > 1, Fail, "no-alg-none-only", "ID tokens are signed", "§2", strings.Join(algs, ", "), "only alg none is advertised; ID tokens must be signed")
 	s.requirement(!contains(algs, "none"), Warn, "no-alg-none", "alg none is not offered for ID tokens", "§3.1.3.7", "", "none is advertised; a client must never accept it for the code flow")
+	if r.Keys != nil && r.Keys.Response != nil {
+		cache := r.Keys.Response.Header.Get("Cache-Control")
+		s.requirement(cache != "", Warn, "jwks-cacheable", "key set response has Cache-Control", "§10.2.1", cache, "no Cache-Control header; Core recommends a max-age so clients know how long to keep keys")
+	}
 	if !contains(source.Strings("subject_types_supported"), "public") && !contains(source.Strings("subject_types_supported"), "pairwise") {
 		s.warn("subject-types", "subject types are public or pairwise", "§8", "advertised: "+strings.Join(source.Strings("subject_types_supported"), ", "))
 	} else {
@@ -639,7 +662,7 @@ func (r *Runner) checkOpenIDCore(ctx context.Context) {
 	}
 	claims, _, err := r.Client.UserInfo(ctx, userinfo, token, nil)
 	if err != nil {
-		s.fail("userinfo-sub", "UserInfo returns a sub claim", "§5.3.2", describeErr(err))
+		s.untested("userinfo-sub", "UserInfo returns a sub claim", "§5.3.2", "the token was not accepted by UserInfo, so no response claims could be checked: "+describeErr(err))
 		return
 	}
 	sub, _ := claims["sub"].(string)

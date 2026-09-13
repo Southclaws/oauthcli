@@ -28,14 +28,21 @@ type fakeAS struct {
 	clients map[string]string
 
 	// Knobs.
-	omitNoStore     bool
-	plainPKCE       bool
-	openRedirect    bool
-	leakPrivateKey  bool
-	acceptAnyGrant  bool
-	ignoreResource  bool
-	noIntrospection bool
-	nonce           string
+	omitNoStore         bool
+	plainPKCE           bool
+	openRedirect        bool
+	leakPrivateKey      bool
+	acceptAnyGrant      bool
+	ignoreResource      bool
+	noIntrospection     bool
+	noOAuthMetadata     bool
+	omitGrantTypes      bool
+	authzCORS           bool
+	omitDPoPJKT         bool
+	anonymousIntrospect bool
+	ignoreRevocation    bool
+	signedMetadata      bool
+	nonce               string
 }
 
 func newFakeAS() *fakeAS {
@@ -81,6 +88,10 @@ func (f *fakeAS) oauthError(w http.ResponseWriter, status int, code, description
 }
 
 func (f *fakeAS) metadata(w http.ResponseWriter, r *http.Request) {
+	if f.noOAuthMetadata && r.URL.Path == "/.well-known/oauth-authorization-server" {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	methods := []string{"S256"}
 	if f.plainPKCE {
@@ -98,13 +109,18 @@ func (f *fakeAS) metadata(w http.ResponseWriter, r *http.Request) {
 		"registration_endpoint":                          f.issuer() + "/register",
 		"scopes_supported":                               []string{"openid", "read", "write"},
 		"response_types_supported":                       []string{"code", "id_token", "id_token token"},
-		"grant_types_supported":                          []string{"authorization_code", "implicit", "client_credentials", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
 		"token_endpoint_auth_methods_supported":          []string{"client_secret_basic", "client_secret_post", "none"},
 		"code_challenge_methods_supported":               methods,
 		"subject_types_supported":                        []string{"public"},
 		"id_token_signing_alg_values_supported":          []string{"RS256"},
 		"dpop_signing_alg_values_supported":              []string{"ES256"},
 		"authorization_response_iss_parameter_supported": true,
+	}
+	if !f.omitGrantTypes {
+		document["grant_types_supported"] = []string{"authorization_code", "implicit", "client_credentials", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code", "urn:ietf:params:oauth:grant-type:token-exchange"}
+	}
+	if f.signedMetadata {
+		document["signed_metadata"] = "not-verified-by-the-checker"
 	}
 	if !f.noIntrospection {
 		document["introspection_endpoint"] = f.issuer() + "/introspect"
@@ -127,6 +143,9 @@ func (f *fakeAS) jwks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeAS) authorize(w http.ResponseWriter, r *http.Request) {
+	if f.authzCORS {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
 	q := r.URL.Query()
 	redirect := q.Get("redirect_uri")
 	if q.Get("client_id") == "" {
@@ -141,6 +160,7 @@ func (f *fakeAS) authorize(w http.ResponseWriter, r *http.Request) {
 	target, _ := url.Parse(redirect)
 	values := target.Query()
 	values.Set("state", q.Get("state"))
+	values.Set("iss", f.issuer())
 	switch {
 	case q.Get("response_type") != "code":
 		values.Set("error", "unsupported_response_type")
@@ -177,7 +197,7 @@ func (f *fakeAS) mint(clientID, scope, jkt string, ttl time.Duration) string {
 		"iss": f.issuer(), "sub": clientID, "aud": "https://api.example.com", "client_id": clientID,
 		"iat": now.Unix(), "exp": now.Add(ttl).Unix(), "jti": jose.RandomString(8), "scope": scope,
 	}
-	if jkt != "" {
+	if jkt != "" && !f.omitDPoPJKT {
 		claims["cnf"] = map[string]any{"jkt": jkt}
 	}
 	token, _ := jose.Sign(map[string]any{"typ": "at+jwt", "kid": f.kid}, claims, f.key, "RS256")
@@ -270,6 +290,10 @@ func (f *fakeAS) token(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeAS) introspect(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
+	if f.anonymousIntrospect && r.Header.Get("Authorization") == "" && r.PostFormValue("client_secret") == "" {
+		f.writeJSON(w, 200, map[string]any{"active": false})
+		return
+	}
 	if _, ok := f.authenticate(r); !ok || r.PostFormValue("client_id") == "" && r.Header.Get("Authorization") == "" {
 		f.oauthError(w, 401, "invalid_client", "authenticate")
 		return
@@ -293,7 +317,9 @@ func (f *fakeAS) revoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.mu.Lock()
-	f.revoked[r.PostFormValue("token")] = true
+	if !f.ignoreRevocation {
+		f.revoked[r.PostFormValue("token")] = true
+	}
 	f.mu.Unlock()
 	w.WriteHeader(200)
 }

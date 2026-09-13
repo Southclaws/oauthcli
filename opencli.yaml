@@ -1126,8 +1126,8 @@ commands:
     longDescription: |
       Discovers everything the issuer publishes and runs a checklist of
       conformance checks grouped by specification. Each specification is
-      reported as **supported and conformant**, **supported but
-      non-conformant**, **not supported**, or **not tested**.
+      reported as **supported and conformant**, **partially tested**,
+      **supported but non-conformant**, **not supported**, or **not tested**.
 
       Without credentials the checks are limited to what can be observed
       anonymously: metadata, key sets, TLS, endpoint behaviour on bad input,
@@ -1158,6 +1158,9 @@ commands:
       - name: register
         description: Also test dynamic client registration by registering and deleting a client.
         type: boolean
+      - name: initial-token
+        description: Initial access token for a protected dynamic registration endpoint.
+        sensitive: true
       - name: negative
         description: Also send a request with a wrong client secret to check the error response.
         type: boolean
@@ -1903,6 +1906,7 @@ components:
       properties:
         passed:
           type: boolean
+          description: Whether the audit found no confirmed non-conformances; partially tested and untested checks may still be present.
         checks:
           type: array
           items:
@@ -1997,7 +2001,7 @@ components:
           type: string
         verdict:
           type: string
-          enum: [conformant, non-conformant, not-supported, not-tested]
+          enum: [conformant, partially-tested, non-conformant, not-supported, not-tested]
         checks:
           type: array
           items:
@@ -2013,6 +2017,7 @@ components:
           skip,
           untested,
           conformant,
+          partiallyTested,
           nonConformant,
           notSupported,
           notTested,
@@ -2029,6 +2034,8 @@ components:
         untested:
           type: integer
         conformant:
+          type: integer
+        partiallyTested:
           type: integer
         nonConformant:
           type: integer

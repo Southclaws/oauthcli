@@ -65,6 +65,7 @@ type CheckParams struct {
 	Skip             []string
 	Offline          bool
 	Register         bool
+	InitialToken     string
 	Negative         bool
 	Token            string
 	RefreshToken     string
@@ -83,8 +84,8 @@ func NewCheckCommand(check CheckHandler) CheckCommand {
 		Short: "Audit an issuer against the OAuth and OpenID specifications.",
 		Long: `Discovers everything the issuer publishes and runs a checklist of
 conformance checks grouped by specification. Each specification is
-reported as **supported and conformant**, **supported but
-non-conformant**, **not supported**, or **not tested**.
+reported as **supported and conformant**, **partially tested**,
+**supported but non-conformant**, **not supported**, or **not tested**.
 
 Without credentials the checks are limited to what can be observed
 anonymously: metadata, key sets, TLS, endpoint behaviour on bad input,
@@ -118,6 +119,8 @@ registration, are opt-in.
 	cmd.Flags().BoolVar(&rawOffline, "offline", false, "Do not send any request that needs credentials.")
 	var rawRegister bool
 	cmd.Flags().BoolVar(&rawRegister, "register", false, "Also test dynamic client registration by registering and deleting a client.")
+	var rawInitialToken string
+	cmd.Flags().StringVar(&rawInitialToken, "initial-token", "", "Initial access token for a protected dynamic registration endpoint.")
 	var rawNegative bool
 	cmd.Flags().BoolVar(&rawNegative, "negative", false, "Also send a request with a wrong client secret to check the error response.")
 	var rawToken string
@@ -327,6 +330,7 @@ registration, are opt-in.
 			Skip:             rawSkip,
 			Offline:          rawOffline,
 			Register:         rawRegister,
+			InitialToken:     rawInitialToken,
 			Negative:         rawNegative,
 			Token:            rawToken,
 			RefreshToken:     rawRefreshToken,

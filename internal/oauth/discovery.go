@@ -231,6 +231,8 @@ const MultiTenantHint = "a multi-tenant authorization server publishes metadata 
 func (m *Metadata) Validate(allowHTTP bool) []cligen.Issue {
 	var issues []cligen.Issue
 	const rfc8414 = "RFC 8414 §2"
+	const openIDDiscovery = "OpenID Connect Discovery 1.0 §3"
+	issuerSection := metadataSection(m.Kind, rfc8414, openIDDiscovery)
 
 	if m.Response != nil {
 		switch {
@@ -244,7 +246,7 @@ func (m *Metadata) Validate(allowHTTP bool) []cligen.Issue {
 	claimed := m.String("issuer")
 	switch {
 	case claimed == "":
-		issues = append(issues, Errorf("issuer-missing", rfc8414, "issuer", "issuer is required"))
+		issues = append(issues, Errorf("issuer-missing", issuerSection, "issuer", "issuer is required"))
 	case claimed == m.Issuer:
 	case strings.TrimRight(claimed, "/") == strings.TrimRight(m.Issuer, "/"):
 		issues = append(issues, Warnf("issuer-trailing-slash", m.issuerRuleSection(), "issuer", "issuer is %q but the document was fetched for %q; they differ only by a trailing slash, and a client configured without the slash must reject the document", claimed, m.Issuer))
@@ -296,7 +298,8 @@ func (m *Metadata) Validate(allowHTTP bool) []cligen.Issue {
 		issues = append(issues, Errorf("token-endpoint-missing", rfc8414, "token_endpoint", "token_endpoint is required unless only the implicit grant is supported"))
 	}
 	if !m.Has("response_types_supported") {
-		issues = append(issues, Errorf("response-types-missing", rfc8414, "response_types_supported", "response_types_supported is required"))
+		responseTypesSection := metadataSection(m.Kind, rfc8414, openIDDiscovery)
+		issues = append(issues, Errorf("response-types-missing", responseTypesSection, "response_types_supported", "response_types_supported is required"))
 	} else if contains(grants, "authorization_code") && !containsResponseType(m.Strings("response_types_supported"), "code") {
 		issues = append(issues, Warnf("response-types-inconsistent", "RFC 7591 §2", "response_types_supported", "authorization_code is supported but no response type includes code"))
 	}
@@ -308,7 +311,8 @@ func (m *Metadata) Validate(allowHTTP bool) []cligen.Issue {
 		}
 	}
 	if !m.Has("scopes_supported") {
-		issues = append(issues, Warnf("scopes-missing", rfc8414, "scopes_supported", "scopes_supported is recommended"))
+		scopesSection := metadataSection(m.Kind, rfc8414, openIDDiscovery)
+		issues = append(issues, Warnf("scopes-missing", scopesSection, "scopes_supported", "scopes_supported is recommended"))
 	}
 	if !m.Has("code_challenge_methods_supported") {
 		issues = append(issues, Warnf("pkce-not-advertised", "RFC 8414 §2, RFC 9700 §2.1.1", "code_challenge_methods_supported", "code_challenge_methods_supported is absent, which RFC 8414 reads as no PKCE support; publishing it is recommended"))
@@ -399,6 +403,13 @@ func (m *Metadata) Validate(allowHTTP bool) []cligen.Issue {
 	}
 
 	return issues
+}
+
+func metadataSection(kind, oauthSection, openIDSection string) string {
+	if kind == KindOpenID {
+		return openIDSection
+	}
+	return oauthSection
 }
 
 // issuerRuleSection names the text that requires the issuer to be identical

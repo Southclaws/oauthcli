@@ -69,7 +69,11 @@ func (r *Runner) checkJWTAccessTokens(ctx context.Context) {
 	if !s.fromIssuesAny(info.Issues, []string{"issuer-mismatch", "issuer-trailing-slash"}, "iss", "iss exactly matches the issuer", "§4") {
 		s.pass("iss", "iss exactly matches the issuer", "§4", jws.String("iss"))
 	}
-	s.requirement(!info.Timing.Expired, Fail, "not-expired", "token is not expired", "§4", deref(info.Timing.ExpiresIn)+" remaining", "expired")
+	if info.Timing.Expired && r.Options.Token != "" {
+		s.warn("not-expired", "token is not expired", "§4", "the supplied token is expired; this does not establish that the authorization server issued an already-expired token")
+	} else {
+		s.requirement(!info.Timing.Expired, Fail, "not-expired", "token is not expired", "§4", deref(info.Timing.ExpiresIn)+" remaining", "a token obtained during this audit is already expired")
+	}
 	if info.Timing.Lifetime != nil {
 		s.pass("lifetime", "token lifetime", "", *info.Timing.Lifetime)
 	}
@@ -89,9 +93,8 @@ func (r *Runner) checkIntrospection(ctx context.Context) {
 	s.pass("advertised", "introspection_endpoint is advertised", "RFC 8414 §2", endpoint)
 	advertised := r.Metadata.Strings("introspection_endpoint_auth_methods_supported")
 
-	// RFC 7662 §2.1 and §4: the endpoint must require authorization. A bare
-	// {"active": false} to an anonymous caller reveals nothing, so it is
-	// graded as uncertain rather than as a violation.
+	// RFC 7662 §2.1 and §4: the endpoint must require protected-resource
+	// authentication, even when an anonymous probe would reveal only inactive.
 	anonymous, err := r.Client.PostForm(ctx, endpoint, url.Values{"token": {"oauthcli-probe"}}, nil)
 	if err == nil {
 		document, _ := anonymous.JSON()
@@ -100,10 +103,12 @@ func (r *Runner) checkIntrospection(ctx context.Context) {
 		case anonymous.Status == 400 || anonymous.Status == 401 || anonymous.Status == 403:
 			s.pass("authenticated", "unauthenticated introspection is refused", "§2.1, §4", fmt.Sprintf("HTTP %d", anonymous.Status))
 		case anonymous.Status == 200 && document != nil && !active && len(document) == 1:
-			s.warn("authenticated", "unauthenticated introspection is refused", "§2.1, §4", "an anonymous call answered active=false rather than an authentication error; nothing leaked, but the endpoint should require credentials")
+			s.fail("authenticated", "unauthenticated introspection is refused", "§2.1, §4", "an anonymous call answered active=false; RFC 7662 requires protected resources to authenticate to this endpoint")
 		default:
 			s.fail("authenticated", "unauthenticated introspection is refused", "§2.1, §4", fmt.Sprintf("HTTP %d with %d member(s); anyone can probe token validity", anonymous.Status, len(document)))
 		}
+	} else {
+		s.untested("authenticated", "unauthenticated introspection is refused", "§2.1, §4", describeErr(err))
 	}
 
 	if !r.hasCredentials() {
@@ -239,37 +244,63 @@ func (r *Runner) checkRevocation(ctx context.Context) {
 	if !revoked {
 		return
 	}
+	r.checkRevocationEffect(ctx, s, endpoint, fresh, advertised)
+}
+
+func (r *Runner) checkRevocationEffect(ctx context.Context, s *Spec, endpoint string, fresh *oauth.TokenResult, advertised []string) {
 	if introspection := r.Metadata.String("introspection_endpoint"); introspection != "" {
 		after, _, err := r.Client.Introspect(ctx, introspection, fresh.AccessToken, "access_token", r.Options.Credentials, r.Metadata.Strings("introspection_endpoint_auth_methods_supported"))
 		if err != nil {
 			s.warn("effective", "revoked token introspects as inactive", "§2.1, RFC 7662 §4", describeErr(err))
-		} else {
-			active, _ := after["active"].(bool)
-			s.requirement(!active, Fail, "effective", "revoked token introspects as inactive", "§2.1, RFC 7662 §4", "active=false after revocation", "the token is still active after revocation; invalidation must take place immediately")
+			s.untested("hint-fallback", "a wrong token_type_hint still revokes the token", "§2.1", "baseline access-token revocation could not be confirmed")
+			return
 		}
-
-		// RFC 7009 §2.1: a wrong hint must not stop the server finding the
-		// token.
-		second, err := r.Client.Token(ctx, oauth.TokenRequest{Endpoint: r.Metadata.String("token_endpoint"), Grant: oauth.GrantClientCredentials, Credentials: r.Options.Credentials, Advertised: r.Metadata.TokenAuthMethods(), Scopes: r.Options.Scopes, Audience: r.Options.Audience, Resources: r.Options.Resources})
-		if err == nil {
-			if hinted, err := r.Client.Revoke(ctx, endpoint, second.AccessToken, "refresh_token", r.Options.Credentials, advertised); err == nil && hinted.Status == 200 {
-				check, _, err := r.Client.Introspect(ctx, introspection, second.AccessToken, "access_token", r.Options.Credentials, r.Metadata.Strings("introspection_endpoint_auth_methods_supported"))
-				if err == nil {
-					active, _ := check["active"].(bool)
-					s.requirement(!active, Fail, "hint-fallback", "a wrong token_type_hint still revokes the token", "§2.1", "revoked with token_type_hint=refresh_token", "the token stayed active when revoked with token_type_hint=refresh_token; the search must extend across all token types")
-				}
-			}
+		active, _ := after["active"].(bool)
+		if active {
+			s.warn("effective", "revoked token introspects as inactive", "§2.1, RFC 7662 §4", "the token was still active in an immediate check; RFC 7009 acknowledges propagation delay but says implementations should minimize it")
+			s.untested("hint-fallback", "a wrong token_type_hint still revokes the token", "§2.1", "baseline access-token revocation was not confirmed, so a wrong-hint probe would be inconclusive")
+			return
 		}
-	} else if r.Metadata.String("userinfo_endpoint") != "" && strings.Contains(" "+fresh.Scope+" ", " openid ") {
+		s.pass("effective", "revoked token introspects as inactive", "§2.1, RFC 7662 §4", "active=false after revocation")
+		r.checkRevocationHint(ctx, s, endpoint, introspection, advertised)
+		return
+	}
+	if r.Metadata.String("userinfo_endpoint") != "" && strings.Contains(" "+fresh.Scope+" ", " openid ") {
 		_, response, err := r.Client.UserInfo(ctx, r.Metadata.String("userinfo_endpoint"), fresh.AccessToken, nil)
 		if err == nil {
 			s.fail("effective", "revoked token is refused by protected endpoints", "§2.1", "UserInfo still accepts the revoked token")
 		} else if response != nil {
 			s.pass("effective", "revoked token is refused by protected endpoints", "§2.1", fmt.Sprintf("UserInfo answered HTTP %d", response.Status))
+		} else {
+			s.untested("effective", "revoked token is refused by protected endpoints", "§2.1", describeErr(err))
 		}
-	} else {
-		s.skip("effective", "revoked token introspects as inactive", "§2.1", "no introspection endpoint to confirm with")
+		return
 	}
+	s.untested("effective", "revoked token is unusable after revocation", "§2.1", "no introspection or suitable protected endpoint is available to confirm invalidation")
+}
+
+func (r *Runner) checkRevocationHint(ctx context.Context, s *Spec, endpoint, introspection string, advertised []string) {
+	second, err := r.Client.Token(ctx, oauth.TokenRequest{Endpoint: r.Metadata.String("token_endpoint"), Grant: oauth.GrantClientCredentials, Credentials: r.Options.Credentials, Advertised: r.Metadata.TokenAuthMethods(), Scopes: r.Options.Scopes, Audience: r.Options.Audience, Resources: r.Options.Resources})
+	if err != nil {
+		s.untested("hint-fallback", "a wrong token_type_hint still revokes the token", "§2.1", "could not obtain a second token: "+describeErr(err))
+		return
+	}
+	hinted, err := r.Client.Revoke(ctx, endpoint, second.AccessToken, "refresh_token", r.Options.Credentials, advertised)
+	if err != nil || hinted.Status != 200 {
+		detail := describeErr(err)
+		if err == nil {
+			detail = fmt.Sprintf("HTTP %d", hinted.Status)
+		}
+		s.untested("hint-fallback", "a wrong token_type_hint still revokes the token", "§2.1", detail)
+		return
+	}
+	check, _, err := r.Client.Introspect(ctx, introspection, second.AccessToken, "access_token", r.Options.Credentials, r.Metadata.Strings("introspection_endpoint_auth_methods_supported"))
+	if err != nil {
+		s.untested("hint-fallback", "a wrong token_type_hint still revokes the token", "§2.1", describeErr(err))
+		return
+	}
+	active, _ := check["active"].(bool)
+	s.requirement(!active, Fail, "hint-fallback", "a wrong token_type_hint still revokes the token", "§2.1", "revoked with token_type_hint=refresh_token", "the token stayed active when revoked with token_type_hint=refresh_token; the search must extend across all token types")
 }
 
 func (r *Runner) checkDevice(ctx context.Context) {
@@ -305,7 +336,7 @@ func (r *Runner) checkDevice(ctx context.Context) {
 			s.fail("client-auth", "device endpoint accepts the client authentication the token endpoint accepts", "§3.1, RFC 6749 §3.2.1", "the token endpoint recognised the client but the device endpoint answered invalid_client with the same credentials; client authentication must work as at the token endpoint")
 			return
 		case ok && (oauthErr.Code == "unauthorized_client" || oauthErr.Code == "invalid_client" || oauthErr.Code == "invalid_scope"):
-			s.skip("response", "device authorization response has the required members", "§3.2", "the client cannot use the device grant with this configuration: "+oauthErr.Error())
+			s.untested("response", "device authorization response has the required members", "§3.2", "the client cannot use the device grant with this configuration: "+oauthErr.Error())
 			return
 		case ok:
 			s.fail("response", "device authorization response has the required members", "§3.2", oauthErr.Error())
@@ -371,15 +402,17 @@ func (r *Runner) checkPAR(ctx context.Context) {
 		s.skip("required", "pushed authorization requests are required", "§5", "optional for clients")
 	}
 
-	if !r.hasCredentials() {
-		s.untested("push", "pushing a request returns a request_uri", "§2.2", "needs credentials")
+	if !r.hasCredentials() || r.Options.RedirectURI == "" {
+		detail := "needs credentials and a registered --redirect-uri"
+		s.untested("rejects-request-uri", "PAR endpoint rejects a request_uri parameter", "§2.1", detail)
+		s.untested("push", "pushing a request returns a request_uri", "§2.2", detail)
 		return
 	}
 	pkce, _ := oauth.NewPKCE(64)
 	request := &oauth.AuthorizationRequest{
 		Endpoint:    r.Metadata.String("authorization_endpoint"),
 		ClientID:    r.Options.Credentials.ClientID,
-		RedirectURI: r.probeRedirectURI(),
+		RedirectURI: r.Options.RedirectURI,
 		Scopes:      r.Options.Scopes,
 		State:       oauth.NewState(),
 		PKCE:        pkce,
@@ -409,8 +442,8 @@ func (r *Runner) checkPAR(ctx context.Context) {
 
 	requestURI, expiresIn, issues, err := r.Client.Push(ctx, endpoint, request, r.Options.Credentials, r.Metadata.TokenAuthMethods(), nil)
 	if err != nil {
-		if oauthErr, ok := oauthErrorOf(err); ok && (oauthErr.Code == "invalid_request" || oauthErr.Code == "invalid_client" || oauthErr.Code == "unauthorized_client") && strings.Contains(strings.ToLower(oauthErr.Description), "redirect") {
-			s.skip("push", "pushing a request returns a request_uri", "§2.2", "the probe redirect URI is not registered for the client: "+oauthErr.Error())
+		if oauthErr, ok := oauthErrorOf(err); ok && (oauthErr.Code == "invalid_request" || oauthErr.Code == "invalid_client" || oauthErr.Code == "unauthorized_client") {
+			s.untested("push", "pushing a request returns a request_uri", "§2.2", "the client or redirect URI is not authorized for this request: "+oauthErr.Error())
 			return
 		}
 		s.fail("push", "pushing a request returns a request_uri", "§2.2", describeErr(err))
@@ -450,7 +483,7 @@ func (r *Runner) checkDPoP(ctx context.Context) {
 		return
 	}
 	if !contains(algs, dpop.Alg) && len(algs) > 0 {
-		s.skip("bound", "token request with a DPoP proof yields a DPoP-bound token", "§5", fmt.Sprintf("the server offers %s but the probe key uses %s; pass --dpop-key with a matching key", strings.Join(algs, ", "), dpop.Alg))
+		s.untested("bound", "token request with a DPoP proof yields a DPoP-bound token", "§5", fmt.Sprintf("the server offers %s but the probe key uses %s; pass --dpop-key with a matching key", strings.Join(algs, ", "), dpop.Alg))
 		return
 	}
 	result, err := r.obtainToken(ctx, dpop)
@@ -470,14 +503,14 @@ func (r *Runner) checkDPoP(ctx context.Context) {
 	case !bound:
 		s.skip("jkt", "JWT access token carries cnf.jkt of the proof key", "§6.1", "the token is not DPoP-bound")
 	case jws == nil:
-		s.skip("jkt", "JWT access token carries cnf.jkt of the proof key", "§6.1", "the access token is opaque; the binding may be exposed through introspection (§6.2)")
+		s.untested("jkt", "DPoP-bound token exposes cnf.jkt", "§6.1, §6.2", "the access token is opaque; pass credentials authorized for introspection to check the binding")
 	default:
 		cnf, _ := jws.Claims["cnf"].(map[string]any)
 		jkt, _ := cnf["jkt"].(string)
 		thumbprint, _ := dpop.Thumbprint()
 		switch {
 		case jkt == "":
-			s.warn("jkt", "JWT access token carries cnf.jkt of the proof key", "§6.1", "the bound token has no cnf.jkt; the binding may be exposed through introspection instead (§6.2)")
+			s.fail("jkt", "JWT access token carries cnf.jkt of the proof key", "§6.1", "the access token is a JWT and token_type is DPoP, but cnf.jkt is missing")
 		default:
 			s.requirement(jkt == thumbprint, Fail, "jkt", "JWT access token carries cnf.jkt of the proof key", "§6.1", jkt, fmt.Sprintf("cnf.jkt is %q, want %q", jkt, thumbprint))
 		}
@@ -494,6 +527,8 @@ func (r *Runner) checkDPoP(ctx context.Context) {
 		Credentials: r.Options.Credentials,
 		Advertised:  r.Metadata.TokenAuthMethods(),
 		Scopes:      r.Options.Scopes,
+		Audience:    r.Options.Audience,
+		Resources:   r.Options.Resources,
 		DPoP:        broken,
 	})
 	switch oauthErr, ok := oauthErrorOf(err); {
@@ -575,11 +610,13 @@ func (r *Runner) checkResourceIndicators(ctx context.Context) {
 	_, err = r.Client.Token(ctx, request)
 	switch oauthErr, ok := oauthErrorOf(err); {
 	case err == nil:
-		s.warn("malformed", "resource value with a fragment is rejected", "§2", "a token was issued for a resource value carrying a fragment")
+		s.fail("malformed", "resource value with a fragment is rejected", "§2", "a token was issued for a resource value carrying a fragment")
 	case ok && oauthErr.Code == "invalid_target":
 		s.pass("malformed", "resource value with a fragment is rejected", "§2", "invalid_target")
 	case ok:
 		s.warn("malformed", "resource value with a fragment is rejected", "§2", "rejected with "+oauthErr.Code+" instead of invalid_target")
+	default:
+		s.untested("malformed", "resource value with a fragment is rejected", "§2", describeErr(err))
 	}
 
 	if len(r.Options.Resources) > 0 && r.Obtained != nil {
@@ -612,19 +649,37 @@ func (r *Runner) checkJWTClientAuth(ctx context.Context) {
 	}
 	s.requirement(auth, Skip, "advertised", "private_key_jwt or client_secret_jwt is advertised", "§2.2", strings.Join(methods, ", "), "not advertised")
 	s.requirement(bearer, Skip, "bearer-grant", "jwt-bearer grant is advertised", "§2.1", "", "not advertised")
+	if bearer {
+		s.untested("bearer-grant-flow", "JWT bearer authorization grant accepts a valid subject assertion", "§2.1", "this command has no subject-assertion input")
+	}
 	if algs := r.Metadata.Strings("token_endpoint_auth_signing_alg_values_supported"); len(algs) > 0 {
 		s.requirement(!contains(algs, "none"), Fail, "alg-none", "assertion algorithms exclude none", "RFC 8414 §2", strings.Join(algs, ", "), "none is advertised")
 	}
-	if !r.hasCredentials() || r.Options.Credentials.Key == nil {
-		s.untested("assertion", "client authenticates with a signed assertion", "§2.2", "pass --client-key to authenticate with private_key_jwt")
+	if auth {
+		r.checkJWTClientAuthentication(ctx, s, methods)
+	}
+}
+
+func (r *Runner) checkJWTClientAuthentication(ctx context.Context, s *Spec, methods []string) {
+	if !r.hasCredentials() {
+		s.untested("assertion", "client authenticates with a signed assertion", "§2.2", "needs the client secret or private key for an advertised JWT authentication method")
 		return
 	}
 	credentials := *r.Options.Credentials
-	credentials.Method = oauth.AuthPrivateKeyJWT
+	switch {
+	case contains(methods, oauth.AuthPrivateKeyJWT) && credentials.Key != nil:
+		credentials.Method = oauth.AuthPrivateKeyJWT
+	case contains(methods, oauth.AuthSecretJWT) && credentials.ClientSecret != "":
+		credentials.Method = oauth.AuthSecretJWT
+	default:
+		s.untested("assertion", "client authenticates with a signed assertion", "§2.2", "the supplied credentials do not match an advertised JWT authentication method")
+		return
+	}
 	result, err := r.Client.Token(ctx, oauth.TokenRequest{
 		Endpoint:    r.Metadata.String("token_endpoint"),
 		Grant:       oauth.GrantClientCredentials,
 		Credentials: &credentials,
+		Advertised:  methods,
 		Scopes:      r.Options.Scopes,
 	})
 	if err != nil {
@@ -638,9 +693,8 @@ func (r *Runner) checkJWTClientAuth(ctx context.Context) {
 	s.pass("assertion", "client authenticates with a signed assertion", "§2.2", "token_type="+result.TokenType)
 
 	if r.Options.Negative {
-		// RFC 7523 §3 items 3, 4 and 9, §3.2: an assertion with the wrong
-		// audience, an expired assertion, and a bad signature must each be
-		// refused with invalid_client.
+		// RFC 7523 §3 items 3 and 4, §3.2: assertions with a wrong audience
+		// or an expired validity window must be refused with invalid_client.
 		for _, probe := range []struct {
 			id, title string
 			mutate    func(c *oauth.Credentials)
@@ -662,6 +716,8 @@ func (r *Runner) checkJWTClientAuth(ctx context.Context) {
 				s.untested(probe.id, probe.title, "§3", describeErr(err))
 			}
 		}
+	} else {
+		s.untested("negative-assertions", "invalid JWT client assertions are rejected", "§3, §3.2", "pass --negative to send wrong-audience and expired assertions")
 	}
 }
 
@@ -745,36 +801,10 @@ func (r *Runner) checkRegistration(ctx context.Context) {
 	s.pass("advertised", "registration_endpoint is advertised", "RFC 8414 §2", endpoint)
 
 	if !r.Options.Register {
-		s.skip("register", "registering a client returns 201 with client_id", "§3.2.1", "pass --register to create and delete a throwaway client")
+		s.untested("register", "registering a client returns 201 with client_id", "§3.2.1", "pass --register to create and delete a throwaway client")
 		return
 	}
-
-	// An invalid document should produce an RFC 7591 §3.2.2 error, but a
-	// server may substitute a valid value and register the client anyway; if
-	// it does, the client is removed again.
-	response, err := r.Client.PostJSON(ctx, "POST", endpoint, map[string]any{"redirect_uris": "not-an-array"}, authHeader(r.Options.InitialToken))
-	if err == nil {
-		oauthErr := oauth.ParseError(response)
-		switch {
-		case response.Status == 400:
-			s.pass("error-shape", "invalid registration is rejected with 400", "§3.2.2", oauthErr.Code)
-			s.requirement(contains([]string{"invalid_client_metadata", "invalid_redirect_uri", "invalid_software_statement", "unapproved_software_statement"}, oauthErr.Code), Warn, "error-code", "registration error uses a registered code", "§3.2.2", oauthErr.Code, fmt.Sprintf("error code %q is not one §3.2.2 defines", oauthErr.Code))
-		case response.Status == 401 || response.Status == 403:
-			s.pass("error-shape", "invalid registration is rejected with 400", "§3, §3.2.2", fmt.Sprintf("HTTP %d: registration needs an initial access token", response.Status))
-		case response.Status == 201:
-			s.warn("error-shape", "invalid registration is rejected with 400", "§3.2.1, §3.2.2", "the server registered a client from a malformed document, which §3.2.1 permits by substitution")
-			if created, err := oauth.ParseTokenlessRegistration(response); err == nil && created.RegistrationClientURI != "" {
-				_, _ = r.Client.DeleteClient(ctx, created.RegistrationClientURI, created.RegistrationAccessToken)
-			}
-		default:
-			s.fail("error-shape", "invalid registration is rejected with 400", "§3.2.2", fmt.Sprintf("HTTP %d", response.Status))
-		}
-		if response.Status == 401 || response.Status == 403 {
-			s.skip("protected", "open registration is allowed", "§3", fmt.Sprintf("HTTP %d: the endpoint requires an initial access token, which §3 permits (MAY)", response.Status))
-		} else {
-			s.pass("protected", "open registration is allowed", "§3", "registration requests without authorization are accepted, as §3 recommends (SHOULD)")
-		}
-	}
+	r.checkRegistrationErrors(ctx, s, endpoint)
 
 	registration, err := r.Client.Register(ctx, endpoint, map[string]any{
 		"client_name":                "oauthcli conformance probe",
@@ -786,6 +816,10 @@ func (r *Runner) checkRegistration(ctx context.Context) {
 	if err != nil {
 		if oauthErr, ok := oauthErrorOf(err); ok && (oauthErr.Status == 401 || oauthErr.Status == 403) && r.Options.InitialToken == "" {
 			s.untested("register", "registering a client returns 201 with client_id", "§3.2.1", "the endpoint requires an initial access token; pass --initial-token")
+			return
+		}
+		if oauthErr, ok := oauthErrorOf(err); ok && contains([]string{"invalid_client_metadata", "invalid_redirect_uri", "invalid_software_statement", "unapproved_software_statement"}, oauthErr.Code) {
+			s.untested("register", "registering a client returns 201 with client_id", "§3.2.1, §3.2.2", "the server rejected the probe client's requested metadata under local policy: "+oauthErr.Error())
 			return
 		}
 		s.fail("register", "registering a client returns 201 with client_id", "§3.2.1", describeErr(err))
@@ -845,6 +879,40 @@ func (r *Runner) checkRegistration(ctx context.Context) {
 	}
 }
 
+func (r *Runner) checkRegistrationErrors(ctx context.Context, s *Spec, endpoint string) {
+	// An invalid document should produce an RFC 7591 §3.2.2 error, but a
+	// server may substitute a valid value and register the client anyway; if
+	// it does, the client is removed again.
+	response, err := r.Client.PostJSON(ctx, "POST", endpoint, map[string]any{"redirect_uris": "not-an-array"}, authHeader(r.Options.InitialToken))
+	if err == nil {
+		oauthErr := oauth.ParseError(response)
+		switch {
+		case response.Status == 400:
+			s.pass("error-shape", "invalid registration is rejected with 400", "§3.2.2", oauthErr.Code)
+			s.requirement(contains([]string{"invalid_client_metadata", "invalid_redirect_uri", "invalid_software_statement", "unapproved_software_statement"}, oauthErr.Code), Warn, "error-code", "registration error uses a registered code", "§3.2.2", oauthErr.Code, fmt.Sprintf("error code %q is not one §3.2.2 defines", oauthErr.Code))
+		case response.Status == 401 || response.Status == 403:
+			s.untested("error-shape", "invalid registration is rejected with an RFC 7591 error", "§3, §3.2.2", fmt.Sprintf("HTTP %d: registration needs an initial access token", response.Status))
+		case response.Status == 201:
+			s.warn("error-shape", "invalid registration is rejected with 400", "§3.2.1, §3.2.2", "the server registered a client from a malformed document, which §3.2.1 permits by substitution")
+			if created, err := oauth.ParseTokenlessRegistration(response); err == nil && created.RegistrationClientURI != "" {
+				_, _ = r.Client.DeleteClient(ctx, created.RegistrationClientURI, created.RegistrationAccessToken)
+			}
+		default:
+			s.fail("error-shape", "invalid registration is rejected with 400", "§3.2.2", fmt.Sprintf("HTTP %d", response.Status))
+		}
+		if response.Status == 401 || response.Status == 403 {
+			s.skip("protected", "open registration is allowed", "§3", fmt.Sprintf("HTTP %d: the endpoint requires an initial access token, which §3 permits (MAY)", response.Status))
+		} else if response.Status == 400 || response.Status == 201 {
+			s.pass("protected", "open registration is allowed", "§3", "registration requests without authorization are accepted, as §3 recommends (SHOULD)")
+		} else {
+			s.untested("protected", "open registration is allowed", "§3", fmt.Sprintf("HTTP %d does not establish whether an initial access token is required", response.Status))
+		}
+	} else {
+		s.untested("error-shape", "invalid registration is rejected with an RFC 7591 error", "§3.2.2", describeErr(err))
+		s.untested("protected", "open registration is allowed", "§3", describeErr(err))
+	}
+}
+
 func authHeader(token string) map[string][]string {
 	if token == "" {
 		return nil
@@ -893,7 +961,6 @@ func (r *Runner) gradeResource(s *Spec, metadata *oauth.ResourceMetadata) {
 	s.fromIssues(issues, "signing-alg-none", "signing-alg-none", "resource_signing_alg_values_supported excludes none", "§2", "")
 	s.fromIssues(issues, "scopes-missing", "scopes", "scopes_supported is advertised", "§2", strings.Join(metadata.Strings("scopes_supported"), " "))
 	s.fromIssues(issues, "resource-name-missing", "resource-name", "resource_name is advertised", "§2", metadata.String("resource_name"))
-	s.fromIssues(issues, "bearer-query", "no-bearer-query", "tokens are not accepted in the query string", "OAuth 2.1 §5.1", "")
 	servers := metadata.Strings("authorization_servers")
 	switch {
 	case !metadata.Has("authorization_servers"):

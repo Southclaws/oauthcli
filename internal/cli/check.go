@@ -52,6 +52,7 @@ func check(ctx context.Context, cmd *cobra.Command, commandIO cligen.IO, p clige
 		RedirectURI:  s.Settings.RedirectURI,
 		Offline:      p.Offline,
 		Register:     p.Register,
+		InitialToken: p.InitialToken,
 		Negative:     p.Negative,
 		DPoPKey:      dpopKey,
 		Only:         p.Only,
@@ -81,10 +82,14 @@ func check(ctx context.Context, cmd *cobra.Command, commandIO cligen.IO, p clige
 
 	warnings := report.Summary.Warn > 0
 	failed := !report.Passed || (string(p.FailOn) == "warn" && warnings)
+	failureDetail := "the audit found non-conformances"
+	if report.Passed {
+		failureDetail = "the audit found warnings"
+	}
 
 	if machineReadable(format) {
 		if failed {
-			return report, s.fail(format, report, fmt.Errorf("%w: the audit found non-conformances", ErrFailed))
+			return report, s.fail(format, report, fmt.Errorf("%w: %s", ErrFailed, failureDetail))
 		}
 		return report, nil
 	}
@@ -102,7 +107,7 @@ func check(ctx context.Context, cmd *cobra.Command, commandIO cligen.IO, p clige
 		renderChecklist(s.Out, report, string(p.Show) == "problems")
 	}
 	if failed {
-		return report, fmt.Errorf("%w: the audit found non-conformances", ErrFailed)
+		return report, fmt.Errorf("%w: %s", ErrFailed, failureDetail)
 	}
 	return report, nil
 }
@@ -111,6 +116,8 @@ func verdictBadge(out *render.Printer, verdict string) string {
 	switch verdict {
 	case conformance.Conformant:
 		return out.Badge("good", "SUPPORTED · CONFORMANT")
+	case conformance.PartiallyTested:
+		return out.Badge("info", "SUPPORTED · PARTIALLY TESTED")
 	case conformance.NonConformant:
 		return out.Badge("bad", "SUPPORTED · NON-CONFORMANT")
 	case conformance.NotSupported:
@@ -124,6 +131,8 @@ func verdictText(verdict string) string {
 	switch verdict {
 	case conformance.Conformant:
 		return "supported, conformant"
+	case conformance.PartiallyTested:
+		return "supported, partially tested"
 	case conformance.NonConformant:
 		return "supported, non-conformant"
 	case conformance.NotSupported:
@@ -185,8 +194,9 @@ func renderChecklist(out *render.Printer, report cligen.ConformanceReport, probl
 	}
 
 	summary := report.Summary
-	out.Printf("%s  %s  %s  %s\n",
+	out.Printf("%s  %s  %s  %s  %s\n",
 		out.Badge("good", fmt.Sprintf("%d CONFORMANT", summary.Conformant)),
+		out.Badge("info", fmt.Sprintf("%d PARTIALLY TESTED", summary.PartiallyTested)),
 		out.Badge("bad", fmt.Sprintf("%d NON-CONFORMANT", summary.NonConformant)),
 		out.Badge("skip", fmt.Sprintf("%d NOT SUPPORTED", summary.NotSupported)),
 		out.Badge("info", fmt.Sprintf("%d NOT TESTED", summary.NotTested)),
@@ -262,8 +272,8 @@ func checkMarkdown(report cligen.ConformanceReport) string {
 		mode = "with client credentials"
 	}
 	fmt.Fprintf(&b, "Issuer `%s`, audited %s (%s) in %s by oauthcli.\n\n", report.Issuer, report.StartedAt.Format(time.RFC3339), mode, render.Duration(time.Duration(report.ElapsedMs)*time.Millisecond))
-	fmt.Fprintf(&b, "| Verdict | Count |\n|---|---|\n| Supported, conformant | %d |\n| Supported, non-conformant | %d |\n| Not supported | %d |\n| Not tested | %d |\n\n",
-		report.Summary.Conformant, report.Summary.NonConformant, report.Summary.NotSupported, report.Summary.NotTested)
+	fmt.Fprintf(&b, "| Verdict | Count |\n|---|---|\n| Supported, conformant | %d |\n| Supported, partially tested | %d |\n| Supported, non-conformant | %d |\n| Not supported | %d |\n| Not tested | %d |\n\n",
+		report.Summary.Conformant, report.Summary.PartiallyTested, report.Summary.NonConformant, report.Summary.NotSupported, report.Summary.NotTested)
 
 	b.WriteString("## Specifications\n\n| Specification | Verdict |\n|---|---|\n")
 	for _, spec := range report.Specs {

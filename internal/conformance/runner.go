@@ -24,10 +24,11 @@ const (
 
 // Spec verdicts.
 const (
-	Conformant    = "conformant"
-	NonConformant = "non-conformant"
-	NotSupported  = "not-supported"
-	NotTested     = "not-tested"
+	Conformant      = "conformant"
+	PartiallyTested = "partially-tested"
+	NonConformant   = "non-conformant"
+	NotSupported    = "not-supported"
+	NotTested       = "not-tested"
 )
 
 // Options configure an audit.
@@ -95,8 +96,8 @@ type Runner struct {
 	Obtained *oauth.TokenResult
 	// refreshed is the result of the refresh_token grant, when it ran.
 	refreshed *oauth.TokenResult
-	// clientRecognised records that the token endpoint accepted the client's
-	// identity (any answer other than invalid_client), so a later
+	// clientRecognised records that the token endpoint issued a token to the
+	// client, so a later
 	// invalid_client from another endpoint points at that endpoint.
 	clientRecognised bool
 	// grantUnavailable explains why the client credentials grant could not
@@ -264,7 +265,7 @@ func (s *Spec) Verdict() string {
 	if s.supported != nil && !*s.supported {
 		return NotSupported
 	}
-	tested, failed := false, false
+	tested, failed, untested := false, false, false
 	for _, check := range s.Checks {
 		switch check.Status {
 		case Fail:
@@ -272,6 +273,8 @@ func (s *Spec) Verdict() string {
 			tested = true
 		case Pass, Warn:
 			tested = true
+		case Untested:
+			untested = true
 		}
 	}
 	switch {
@@ -279,6 +282,8 @@ func (s *Spec) Verdict() string {
 		return NonConformant
 	case !tested:
 		return NotTested
+	case untested:
+		return PartiallyTested
 	default:
 		return Conformant
 	}
@@ -382,6 +387,8 @@ func (r *Runner) report() cligen.ConformanceReport {
 		switch result.Verdict {
 		case Conformant:
 			report.Summary.Conformant++
+		case PartiallyTested:
+			report.Summary.PartiallyTested++
 		case NonConformant:
 			report.Summary.NonConformant++
 			report.Passed = false
@@ -420,6 +427,7 @@ func (r *Runner) advertisedOnly(id, title, url string, supported bool, detail st
 	s.supportedIf(supported, "not advertised")
 	if supported {
 		s.pass("advertised", "advertised in metadata", "", detail)
+		s.untested("behavior", "protocol behavior is exercised", "", "this checker currently validates only the metadata advertisement")
 	}
 }
 

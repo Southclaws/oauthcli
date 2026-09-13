@@ -109,7 +109,7 @@ oauthcli check -p dev --only rfc7636,oauth2.1 -f json
 oauthcli check -p dev -f markdown > report.md
 ```
 
-Each specification is reported as **supported, conformant**, **supported, non-conformant**, **not supported**, or **not tested**:
+Each specification is reported as **supported, conformant**, **supported, partially tested**, **supported, non-conformant**, **not supported**, or **not tested**. A partially tested verdict means at least one check produced evidence while another applicable check could not be exercised:
 
 ```
 ◆ Proof Key for Code Exchange (RFC 7636)   SUPPORTED · CONFORMANT

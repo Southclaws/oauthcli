@@ -74,15 +74,16 @@ type SpecResult struct {
 }
 
 type Summary struct {
-	Conformant    int `json:"conformant"`
-	Fail          int `json:"fail"`
-	NonConformant int `json:"nonConformant"`
-	NotSupported  int `json:"notSupported"`
-	NotTested     int `json:"notTested"`
-	Pass          int `json:"pass"`
-	Skip          int `json:"skip"`
-	Untested      int `json:"untested"`
-	Warn          int `json:"warn"`
+	Conformant      int `json:"conformant"`
+	Fail            int `json:"fail"`
+	NonConformant   int `json:"nonConformant"`
+	NotSupported    int `json:"notSupported"`
+	NotTested       int `json:"notTested"`
+	PartiallyTested int `json:"partiallyTested"`
+	Pass            int `json:"pass"`
+	Skip            int `json:"skip"`
+	Untested        int `json:"untested"`
+	Warn            int `json:"warn"`
 }
 
 type ConformanceReport struct {
@@ -183,8 +184,9 @@ type TokenInfo struct {
 
 type ExpectationReport struct {
 	Checks []Expectation `json:"checks"`
-	Passed bool          `json:"passed"`
-	Token  TokenInfo     `json:"token"`
+	// Whether the audit found no confirmed non-conformances; partially tested and untested checks may still be present.
+	Passed bool      `json:"passed"`
+	Token  TokenInfo `json:"token"`
 }
 
 type IntrospectionReport struct {
